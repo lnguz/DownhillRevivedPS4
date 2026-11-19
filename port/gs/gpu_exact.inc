@@ -42,8 +42,12 @@ typedef struct {
     uint32_t reg[128][4], info[4], palette[256];
 } Constants;
 
-/* MAX_DRAWS primitives per dispatch (DHD_GS_BATCH lowers it); the rest bound one submit's arenas. */
-enum { MAX_DRAWS = 256, MAX_PRIMITIVES = 16384, MAX_STATES = 1024, MAX_BATCHES = 4096,
+/* MAX_DRAWS primitives per dispatch (DHD_GS_BATCH lowers it; a provider may define EXACT_MAX_DRAWS
+   first); the rest bound one submit's arenas. */
+#ifndef EXACT_MAX_DRAWS
+#define EXACT_MAX_DRAWS 256
+#endif
+enum { MAX_DRAWS = EXACT_MAX_DRAWS, MAX_PRIMITIVES = 16384, MAX_STATES = 1024, MAX_BATCHES = 4096,
        MAX_BIN_WORDS = 4 * 1024 * 1024, BATCH_STRIDE = 256 };
 typedef struct {
     uint32_t position[3][4], uv[3][4];

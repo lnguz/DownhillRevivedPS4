@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <orbis/SystemService.h>
 #include <orbis/VideoOut.h>
@@ -34,6 +35,9 @@
 
 double host_widescreen_aspect(void);  /* port/hle/widescreen.c: the picture's shape, 0 for 4:3 */
 
+/* Batches of up to 2048 primitives (the shared front end's default is 256): a batch is one GPU
+   dispatch, followed by a barrier, so larger ones keep more of the GPU busy and wait less. */
+#define EXACT_MAX_DRAWS 2048
 #include "../gs/gpu_exact.inc"  /* the front end: Exact, the CPU half, and the op_* prototypes it calls */
 
 /* ---- the device ---- */
@@ -93,447 +97,19 @@ static Command *command_add(Cpu *cpu, int kind)
     return c;
 }
 
-/* ---- raster.wgsl in C ---- */
+/* ---- raster.wgsl in C (raster_core.h) ---- */
 
-static inline uint32_t load_word(const uint32_t *memory, uint32_t word)
+#define RC_MEM
+#define RC_LOAD(p) __atomic_load_n((p), __ATOMIC_RELAXED)
+#define RC_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
+static inline uint32_t rc_cas(uint32_t *word, uint32_t expected, uint32_t desired)
 {
-    return __atomic_load_n(&memory[word], __ATOMIC_RELAXED);
+    __atomic_compare_exchange_n(word, &expected, desired, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    return expected;
 }
-
-/* D3D's ftoi/ftou: NaN gives 0 and out-of-range values saturate. */
-static inline int32_t f2i(float x)
-{
-    uint32_t bits;
-    memcpy(&bits, &x, 4);
-    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) return 0;
-    if (x >= 2147483648.0f) return 2147483647;
-    if (x <= -2147483648.0f) return (int32_t)(-2147483647 - 1);
-    return (int32_t)x;
-}
-static inline uint32_t f2u(float x)
-{
-    uint32_t bits;
-    memcpy(&bits, &x, 4);
-    if ((bits & 0x7FFFFFFFu) > 0x7F800000u || x <= 0.0f) return 0;
-    if (x >= 4294967296.0f) return 0xFFFFFFFFu;
-    return (uint32_t)x;
-}
-
-static inline uint32_t bits_per_pixel(uint32_t psm)
-{
-    if (psm == 1u || psm == 49u) return 24u;
-    if ((psm & 7u) == 2u) return 16u;
-    if (psm == 19u || psm == 27u) return 8u;
-    if (psm == 20u || psm == 36u || psm == 44u) return 4u;
-    return 32u;
-}
-static inline uint32_t pixel_mask(uint32_t bits) { return bits == 32u ? 0xFFFFFFFFu : (1u << bits) - 1u; }
-
-/* The bit address of pixel (x, y) in GS memory (the shader's ADDRESS_SHIFT form). */
-static inline uint32_t gs_address(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
-{
-    uint32_t pw = 64u, ph = 32u, bits = 32u, high = 0u, block, column, bx, by;
-    if (psm == 19u || psm == 20u) { pw = 128u; ph = psm == 19u ? 64u : 128u; }
-    else if ((psm & 7u) == 2u) ph = 64u;
-    uint32_t sx = pw == 128u ? 7u : 6u;
-    uint32_t sy = ph == 128u ? 7u : ph == 64u ? 6u : 5u;
-    uint32_t px = x, py = y;
-    if (psm == 19u) {
-        bits = 8u; bx = px / 16u; by = py / 16u;
-        block = (bx & 1u) | ((by & 1u) << 1u) | ((bx & 2u) << 1u) | ((by & 2u) << 2u) | ((bx & 4u) << 2u);
-        column = ((px & 1u) << 2u) | ((px & 2u) << 3u) | ((px & 4u) << 3u) | ((px & 8u) >> 2u) |
-                 ((py & 1u) << 3u) | ((py & 2u) >> 1u) | ((py & 4u) << 4u) | ((py & 8u) << 4u);
-        column ^= (((py >> 1u) ^ (py >> 2u)) & 1u) << 5u;
-    } else if (psm == 20u) {
-        bits = 4u; bx = px / 32u; by = py / 16u;
-        block = (by & 1u) | ((bx & 1u) << 1u) | ((by & 2u) << 1u) | ((bx & 2u) << 2u) | ((by & 4u) << 2u);
-        column = ((px & 1u) << 3u) | ((px & 2u) << 4u) | ((px & 4u) << 4u) | ((px & 8u) >> 2u) | ((px & 16u) >> 2u) |
-                 ((py & 1u) << 4u) | ((py & 2u) >> 1u) | ((py & 4u) << 5u) | ((py & 8u) << 5u);
-        column ^= (((py >> 1u) ^ (py >> 2u)) & 1u) << 6u;
-    } else if ((psm & 7u) == 2u) {
-        bits = 16u; bx = px / 16u; by = py / 8u;
-        if (psm & 8u) block = (by & 1u) | ((bx & 1u) << 1u) | (by & 4u) | ((by & 2u) << 2u) | ((bx & 2u) << 3u);
-        else block = (by & 1u) | ((bx & 1u) << 1u) | ((by & 2u) << 1u) | ((bx & 2u) << 2u) | ((by & 4u) << 2u);
-        column = ((px & 1u) << 1u) | ((px & 2u) << 2u) | ((px & 4u) << 2u) | ((px & 8u) >> 3u) |
-                 ((py & 1u) << 2u) | ((py & 6u) << 4u);
-    } else {
-        bx = px / 8u; by = py / 8u;
-        block = (bx & 1u) | ((by & 1u) << 1u) | ((bx & 2u) << 1u) | ((by & 2u) << 2u) | ((bx & 4u) << 2u);
-        column = (px & 1u) | ((px & 6u) << 1u) | ((py & 1u) << 1u) | ((py & 6u) << 3u);
-        if (psm == 27u || psm == 36u) high = 24u;
-        if (psm == 44u) high = 28u;
-    }
-    block += bp + ((y >> sy) * ((bw * 64u) >> sx) + (x >> sx)) * 32u;
-    if ((psm & 48u) == 48u) block ^= 24u;
-    return (block * 2048u + column * bits + high) & 0x1FFFFFFu;
-}
-
-static inline uint32_t read_pixel(const uint32_t *memory, uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
-{
-    uint32_t a = gs_address(psm, bp, bw, x, y);
-    return (load_word(memory, a >> 5) >> (a & 31u)) & pixel_mask(bits_per_pixel(psm));
-}
-
-/* Packed pixels may share a word with another thread's pixel: a word only partly written is
-   changed with a compare-exchange; a whole word is stored. */
-static inline void write_pixel(uint32_t *memory, uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y,
-                               uint32_t value_in, uint32_t preserve)
-{
-    uint32_t a = gs_address(psm, bp, bw, x, y);
-    uint32_t mask = (pixel_mask(bits_per_pixel(psm)) & ~preserve) << (a & 31u);
-    uint32_t value = (value_in << (a & 31u)) & mask;
-    uint32_t *word = &memory[a >> 5];
-    if (mask == 0xFFFFFFFFu) { __atomic_store_n(word, value, __ATOMIC_RELAXED); return; }
-    if (!mask) return;
-    uint32_t old = __atomic_load_n(word, __ATOMIC_RELAXED);
-    while (!__atomic_compare_exchange_n(word, &old, (old & ~mask) | value, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
-}
-
-typedef struct { int32_t r, g, b, a; } Color;
-
-static inline Color rgba(uint32_t v)
-{
-    Color c = {(int32_t)(v & 255u), (int32_t)((v >> 8) & 255u), (int32_t)((v >> 16) & 255u), (int32_t)(v >> 24)};
-    return c;
-}
-static inline uint32_t pack32(Color v)
-{
-    return (uint32_t)v.r | ((uint32_t)v.g << 8) | ((uint32_t)v.b << 16) | ((uint32_t)v.a << 24);
-}
-static inline uint32_t pack16(uint32_t v)
-{
-    return ((v >> 3) & 31u) | ((v >> 6) & 0x3E0u) | ((v >> 9) & 0x7C00u) | ((v >> 16) & 0x8000u);
-}
-static inline int32_t clampi(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
-static inline Color clamp_color(Color c)
-{
-    Color r = {clampi(c.r, 0, 255), clampi(c.g, 0, 255), clampi(c.b, 0, 255), clampi(c.a, 0, 255)};
-    return r;
-}
-
-/* The state's registers, as raster.wgsl reads them: regs[i].x the low word, .y the high one. */
-#define REG_X(st, i) ((st)->reg[i][0])
-#define REG_Y(st, i) ((st)->reg[i][1])
-
-static inline uint32_t expand(const Constants *st, uint32_t value, uint32_t psm, int tex)
-{
-    if ((psm & 7u) == 2u) {
-        uint32_t a = (value & 0x8000u) ? (REG_Y(st, 59) & 255u) : (REG_X(st, 59) & 255u);
-        if (!tex) a = (value & 0x8000u) ? 128u : 0u;
-        if (tex && (REG_X(st, 59) & 0x8000u) && value == 0u) a = 0u;
-        return ((value & 31u) << 3) | ((value & 0x3E0u) << 6) | ((value & 0x7C00u) << 9) | (a << 24);
-    }
-    if ((psm & 7u) == 1u) {
-        uint32_t a = tex ? (REG_X(st, 59) & 255u) : 128u;
-        if (tex && (REG_X(st, 59) & 0x8000u) && value == 0u) a = 0u;
-        return value | (a << 24);
-    }
-    return value;
-}
-
-static inline int32_t clamp_coordinate(int32_t v, uint32_t mode, uint32_t size, uint32_t low, uint32_t high)
-{
-    if (mode == 0u) return v & (int32_t)(size - 1u);
-    if (mode == 1u) return clampi(v, 0, (int32_t)size - 1);
-    if (mode == 2u) return clampi(v, (int32_t)low, (int32_t)high);
-    return (v & (int32_t)low) | (int32_t)high;
-}
-
-static Color texel(const Constants *st, const uint32_t *texture, int32_t x, int32_t y, uint32_t ctxt, uint32_t level)
-{
-    uint32_t tx = REG_X(st, 6 + ctxt), ty = REG_Y(st, 6 + ctxt);
-    uint32_t cx = REG_X(st, 8 + ctxt), cy = REG_Y(st, 8 + ctxt);
-    uint32_t tw = (tx >> 26) & 15u, th = (tx >> 30) | ((ty & 3u) << 2);
-    tw = tw > level ? tw - level : 0u;
-    th = th > level ? th - level : 0u;
-    x = clamp_coordinate(x, cx & 3u, 1u << tw, ((cx >> 4) & 1023u) >> level, ((cx >> 14) & 1023u) >> level);
-    y = clamp_coordinate(y, (cx >> 2) & 3u, 1u << th, ((cx >> 24) | ((cy & 3u) << 8)) >> level, ((cy >> 2) & 1023u) >> level);
-    uint32_t psm = (tx >> 20) & 63u, location = tx;
-    if (level) {
-        unsigned r = (level <= 3u ? 52u : 54u) + ctxt;
-        uint32_t mx = REG_X(st, r), my = REG_Y(st, r), part = (level - 1u) % 3u;
-        location = part == 0u ? mx : part == 1u ? (mx >> 20) | (my << 12) : my >> 8;
-    }
-    uint32_t v = read_pixel(texture, psm, location & 0x3FFFu, (location >> 14) & 63u, (uint32_t)x & 2047u, (uint32_t)y & 2047u);
-    if (psm == 19u || psm == 20u || psm == 27u || psm == 36u || psm == 44u) v = st->palette[v & 255u];
-    else v = expand(st, v, psm, 1);
-    return rgba(v);
-}
-
-static Color sample_texture(const Constants *st, const uint32_t *texture, float sx, float sy, float q, uint32_t ctxt)
-{
-    uint32_t t1x = REG_X(st, 20 + ctxt), t1y = REG_Y(st, 20 + ctxt);
-    uint32_t mmin = (t1x >> 6) & 7u, mxl = (t1x >> 2) & 7u;
-    if (mxl > 6u) mxl = 6u;
-    float k = (float)((int32_t)(t1y << 20) >> 20) / 16.0f;
-    float lod = k;
-    if (!(t1x & 1u)) {
-        float scaled = log2f(fmaxf(fabsf(q), 1.17549435e-38f)) * (float)(1u << ((t1x >> 19) & 3u));
-        lod = lod - scaled;
-    }
-    int filtered;
-    if (mxl == 0u || lod <= 0.0f) filtered = (t1x & 32u) != 0u;
-    else filtered = mmin == 1u || mmin == 4u || mmin == 5u;
-    float clamped = lod < 0.0f ? 0.0f : lod > (float)mxl ? (float)mxl : lod;
-    uint32_t fixed_lod = f2u(clamped * 65536.0f);
-    uint32_t level = 0u, levels = 1u;
-    if (mmin < 2u || mmin > 5u || mxl == 0u) {}
-    else if (!(mmin & 1u)) level = (fixed_lod + 32768u) >> 16;
-    else { level = fixed_lod >> 16; levels = 2u; }
-    unsigned taps = filtered ? 4u : 1u;
-    Color result[2] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
-    for (uint32_t i = 0; i < levels; i++) {
-        uint32_t l = i == 1u ? (level + 1u < mxl ? level + 1u : mxl) : level;
-        float scale = ldexpf(1.0f, -(int)l);
-        float stx = sx * scale, sty = sy * scale;
-        int32_t px, py, fx = 0, fy = 0;
-        if (filtered) {
-            float ax = stx - 0.5f, ay = sty - 0.5f, flx = floorf(ax), fly = floorf(ay);
-            px = f2i(flx); py = f2i(fly);
-            fx = f2i((ax - flx) * 16.0f); fy = f2i((ay - fly) * 16.0f);
-        } else {
-            px = f2i(floorf(stx)); py = f2i(floorf(sty));
-        }
-        Color sum = {0, 0, 0, 0};
-        for (unsigned j = 0; j < taps; j++) {
-            int32_t ox = (int32_t)(j & 1u), oy = (int32_t)(j >> 1);
-            Color t = texel(st, texture, px + ox, py + oy, ctxt, l);
-            int32_t w = (ox == 1 ? fx : 16 - fx) * (oy == 1 ? fy : 16 - fy);
-            sum.r += t.r * w; sum.g += t.g * w; sum.b += t.b * w; sum.a += t.a * w;
-        }
-        result[i].r = sum.r >> 8; result[i].g = sum.g >> 8; result[i].b = sum.b >> 8; result[i].a = sum.a >> 8;
-    }
-    if (levels == 1u) return result[0];
-    int32_t f = (int32_t)((fixed_lod & 65535u) >> 1);
-    Color a = result[0], b = result[1], c;
-    c.r = a.r + (((b.r - a.r) * f) >> 15); c.g = a.g + (((b.g - a.g) * f) >> 15);
-    c.b = a.b + (((b.b - a.b) * f) >> 15); c.a = a.a + (((b.a - a.a) * f) >> 15);
-    return c;
-}
-
-static inline float edge(int32_t ax, int32_t ay, int32_t bx, int32_t by, int32_t px, int32_t py)
-{
-    int32_t dx = bx - ax, dy = by - ay, qx = px - ax, qy = py - ay;
-    uint32_t first = (uint32_t)abs(dx) * (uint32_t)abs(qy);
-    uint32_t second = (uint32_t)abs(dy) * (uint32_t)abs(qx);
-    int first_negative = (dx < 0) != (qy < 0);
-    int second_negative = (dy < 0) != (qx < 0);
-    float result;
-    if (first_negative == second_negative) {
-        if (first >= second) result = (float)(first - second);
-        else result = -(float)(second - first);
-    } else {
-        result = (float)first + (float)second;
-    }
-    return first_negative ? -result : result;
-}
-static inline int top_left(int32_t ax, int32_t ay, int32_t bx, int32_t by)
-{
-    int32_t dx = bx - ax, dy = by - ay;
-    return dy < 0 || (dy == 0 && dx > 0);
-}
-static inline int inside(float e, int32_t ax, int32_t ay, int32_t bx, int32_t by, int sign)
-{
-    int tl = sign > 0 ? top_left(ax, ay, bx, by) : top_left(bx, by, ax, ay);
-    return e * (float)sign > 0.0f || (e == 0.0f && tl);
-}
-
-/* d0 + dzdx * (double)(float)dx + dzdy * (double)(float)dy, each step rounded (raster.wgsl's
-   plane_depth, which emulates these doubles), then its integer part clamped to [0, 2^32 - 1]. */
-static inline uint32_t plane_depth(const uint32_t words[8], int32_t dx, int32_t dy)
-{
-    double d[3];
-    memcpy(d, words, sizeof d);
-    double z = d[0];
-    double term = d[1] * (double)(float)dx;
-    z = z + term;
-    term = d[2] * (double)(float)dy;
-    z = z + term;
-    if (!(z >= 1.0)) return 0u;
-    if (z >= 4294967296.0) return 0xFFFFFFFFu;
-    return (uint32_t)z;
-}
-
-/* What draw_pixel needs of a triangle that is the same at every pixel: its doubled area's edge
-   value and its sign (draw_tile works them out once per tile). */
-typedef struct { float area; int sign; } Setup;
-
-/* raster.wgsl's draw_pixel: primitive d (of state st) at pixel (x, y). */
-static void draw_pixel(uint32_t *memory, const uint32_t *texture, const Primitive *d, const Constants *st,
-                       const Setup *setup, uint32_t x, uint32_t y)
-{
-    uint32_t scanmask = REG_X(st, 34) & 3u;
-    if ((scanmask == 2u && !(y & 1u)) || (scanmask == 3u && (y & 1u))) return;
-    uint32_t prim = d->info[1], ctxt = (prim >> 9) & 1u, type = d->info[0], last = d->info[2] - 1u;
-    int32_t px = (int32_t)x * 16, py = (int32_t)y * 16;
-    int32_t ax = (int32_t)d->position[0][0], ay = (int32_t)d->position[0][1];
-    int32_t bx = (int32_t)d->position[1][0], by = (int32_t)d->position[1][1];
-    int32_t cx = (int32_t)d->position[2][0], cy = (int32_t)d->position[2][1];
-    float w0 = 1.0f, w1 = 0.0f, w2 = 0.0f, fx = 0.0f, fy = 0.0f;
-    if (type == 0u) {
-        if ((ax >> 4) != (int32_t)x || (ay >> 4) != (int32_t)y) return;
-    } else if (type == 6u) {
-        int32_t lx = ax < bx ? ax : bx, hx = ax < bx ? bx : ax, ly = ay < by ? ay : by, hy = ay < by ? by : ay;
-        if (px < lx || py < ly || px >= hx || py >= hy) return;
-        fx = (float)(px - ax) / (float)(bx - ax);
-        fy = (float)(py - ay) / (float)(by - ay);
-        w0 = 0.0f; w1 = 1.0f;
-    } else if (type == 1u || type == 2u) {
-        int32_t ddx = bx - ax, ddy = by - ay;
-        int32_t major = abs(ddx) > abs(ddy) ? abs(ddx) : abs(ddy);
-        if (major == 0) return;
-        float along;
-        if (abs(ddx) >= abs(ddy)) along = (float)(px - ax) / (float)ddx;
-        else along = (float)(py - ay) / (float)ddy;
-        if (along < 0.0f || along >= 1.0f || fabsf(edge(ax, ay, bx, by, px, py)) >= (float)major * 8.0f) return;
-        w0 = 1.0f - along; w1 = along;
-    } else {
-        /* the vertices' box and a zero area are draw_tile's: it visits only pixels inside the box */
-        float area = setup->area;
-        int sign = setup->sign;
-        float e0 = edge(bx, by, cx, cy, px, py), e1 = edge(cx, cy, ax, ay, px, py), e2 = edge(ax, ay, bx, by, px, py);
-        if (!inside(e0, bx, by, cx, cy, sign) || !inside(e1, cx, cy, ax, ay, sign) || !inside(e2, ax, ay, bx, by, sign)) return;
-        w0 = e0 / area; w1 = e1 / area; w2 = e2 / area;
-    }
-    Color color = rgba(d->position[last][3]);
-    if ((prim & 8u) && type != 6u) {
-        Color c0 = rgba(d->position[0][3]), c1 = rgba(d->position[1][3]), c2 = rgba(d->position[2][3]);
-        float r0 = (float)c0.r * w0, r1 = (float)c1.r * w1, r2 = (float)c2.r * w2;
-        float g0 = (float)c0.g * w0, g1 = (float)c1.g * w1, g2 = (float)c2.g * w2;
-        float b0 = (float)c0.b * w0, b1 = (float)c1.b * w1, b2 = (float)c2.b * w2;
-        float a0 = (float)c0.a * w0, a1 = (float)c1.a * w1, a2 = (float)c2.a * w2;
-        float r = r0 + r1, g = g0 + g1, b = b0 + b1, a = a0 + a1;
-        color.r = f2i(r + r2); color.g = f2i(g + g2); color.b = f2i(b + b2); color.a = f2i(a + a2);
-    }
-    uint32_t z = d->position[last][2];
-    int constant_z = d->position[0][2] == d->position[1][2] && (d->info[2] < 3u || d->position[0][2] == d->position[2][2]);
-    if (type != 0u && type != 6u && !constant_z) z = plane_depth(d->depth, px - ax, py - ay);
-    /* the host's independent-pixels proof allows the early depth test (raster.wgsl EARLY_DEPTH) */
-    int early_depth = (st->info[1] & 1u) != 0u;
-    if (early_depth) {
-        uint32_t early_test = REG_X(st, 71 + ctxt);
-        if (early_test & 0x10000u) {
-            uint32_t early_frame = REG_X(st, 76 + ctxt), early_zbuf = REG_X(st, 78 + ctxt);
-            uint32_t early_zpsm = ((early_zbuf >> 24) & 15u) | 48u;
-            uint32_t limit = pixel_mask(bits_per_pixel(early_zpsm));
-            uint32_t early_z = z < limit ? z : limit;
-            uint32_t old_z = read_pixel(memory, early_zpsm, (early_zbuf & 511u) * 32u, (early_frame >> 16) & 63u, x, y);
-            uint32_t ztest = (early_test >> 17) & 3u;
-            if (ztest == 0u || (ztest == 2u && early_z < old_z) || (ztest == 3u && early_z <= old_z)) return;
-        }
-    }
-    if (prim & 16u) {
-        float ix, iy, iz, sx, sy;
-        {
-            float x0 = d->stq[0][0] * w0, x1 = d->stq[1][0] * w1, x2 = d->stq[2][0] * w2;
-            float y0 = d->stq[0][1] * w0, y1 = d->stq[1][1] * w1, y2 = d->stq[2][1] * w2;
-            float z0 = d->stq[0][2] * w0, z1 = d->stq[1][2] * w1, z2 = d->stq[2][2] * w2;
-            ix = (x0 + x1) + x2; iy = (y0 + y1) + y2; iz = (z0 + z1) + z2;
-        }
-        if (type == 6u) {
-            float ox = (d->stq[1][0] - d->stq[0][0]) * fx, oy = (d->stq[1][1] - d->stq[0][1]) * fy;
-            ix = d->stq[0][0] + ox; iy = d->stq[0][1] + oy; iz = d->stq[1][2];
-        }
-        if (prim & 256u) {
-            float u0 = (float)d->uv[0][0], v0 = (float)d->uv[0][1], u1 = (float)d->uv[1][0], v1 = (float)d->uv[1][1];
-            float u2 = (float)d->uv[2][0], v2 = (float)d->uv[2][1];
-            if (type == 6u) {
-                float ou = (u1 - u0) * fx, ov = (v1 - v0) * fy;
-                sx = (u0 + ou) / 16.0f; sy = (v0 + ov) / 16.0f;
-            } else {
-                float a0 = u0 * w0, a1 = u1 * w1, a2 = u2 * w2, b0 = v0 * w0, b1 = v1 * w1, b2 = v2 * w2;
-                sx = ((a0 + a1) + a2) / 16.0f; sy = ((b0 + b1) + b2) / 16.0f;
-            }
-        } else {
-            uint32_t tx = REG_X(st, 6 + ctxt), ty = REG_Y(st, 6 + ctxt);
-            float width = (float)(1u << ((tx >> 26) & 15u)), height = (float)(1u << ((tx >> 30) | ((ty & 3u) << 2)));
-            float q = iz == 0.0f ? 1.17549435e-38f : iz;
-            float mx = ix * width, my = iy * height;
-            sx = mx / q; sy = my / q;
-        }
-        Color tex = sample_texture(st, texture, sx, sy, iz, ctxt);
-        uint32_t t0y = REG_Y(st, 6 + ctxt);
-        uint32_t tfx = (t0y >> 3) & 3u, tcc = (t0y >> 2) & 1u;
-        int32_t alpha = color.a;
-        if (tfx == 0u) {
-            color.r = (color.r * tex.r) >> 7; color.g = (color.g * tex.g) >> 7;
-            color.b = (color.b * tex.b) >> 7; color.a = (color.a * tex.a) >> 7;
-        } else if (tfx == 1u) {
-            color = tex;
-        } else {
-            color.r = ((color.r * tex.r) >> 7) + alpha; color.g = ((color.g * tex.g) >> 7) + alpha;
-            color.b = ((color.b * tex.b) >> 7) + alpha;
-            color.a = tfx == 2u ? tex.a + alpha : tex.a;
-        }
-        if (tcc == 0u) color.a = alpha;
-        color = clamp_color(color);
-    }
-    if (prim & 32u) {
-        float f0 = (float)d->uv[0][2] * w0, f1 = (float)d->uv[1][2] * w1, f2 = (float)d->uv[2][2] * w2;
-        int32_t fog = (int32_t)f2u((f0 + f1) + f2);
-        Color fc = rgba(REG_X(st, 61));
-        color.r = fc.r + (((color.r - fc.r) * fog) >> 8);
-        color.g = fc.g + (((color.g - fc.g) * fog) >> 8);
-        color.b = fc.b + (((color.b - fc.b) * fog) >> 8);
-    }
-    uint32_t test = REG_X(st, 71 + ctxt);
-    int write_frame = 1, write_z = (REG_Y(st, 78 + ctxt) & 1u) == 0u, rgb_only = 0;
-    if (test & 1u) {
-        uint32_t atst = (test >> 1) & 7u;
-        int32_t ref = (int32_t)((test >> 4) & 255u);
-        int pass = atst == 1u || (atst == 2u && color.a < ref) || (atst == 3u && color.a <= ref) ||
-                   (atst == 4u && color.a == ref) || (atst == 5u && color.a >= ref) ||
-                   (atst == 6u && color.a > ref) || (atst == 7u && color.a != ref);
-        if (!pass) {
-            uint32_t afail = (test >> 12) & 3u;
-            if (afail == 0u) return;
-            write_frame = afail != 2u; write_z = write_z && afail == 2u; rgb_only = afail == 3u;
-        }
-    }
-    uint32_t frame = REG_X(st, 76 + ctxt), bw = (frame >> 16) & 63u, bp = (frame & 511u) * 32u, psm = (frame >> 24) & 63u;
-    uint32_t zbuf = REG_X(st, 78 + ctxt), zpsm = ((zbuf >> 24) & 15u) | 48u, zbp = (zbuf & 511u) * 32u;
-    uint32_t zlimit = pixel_mask(bits_per_pixel(zpsm));
-    if (z > zlimit) z = zlimit;
-    uint32_t raw = read_pixel(memory, psm, bp, bw, x, y);
-    Color dst = rgba(expand(st, raw, psm, 0));
-    if ((test & 0x4000u) && psm != 1u && ((dst.a >> 7) != (int32_t)((test >> 15) & 1u))) return;
-    if (test & 0x10000u) {
-        if (!early_depth) {
-            uint32_t ztest = (test >> 17) & 3u, old_z = read_pixel(memory, zpsm, zbp, bw, x, y);
-            if (ztest == 0u || (ztest == 2u && z < old_z) || (ztest == 3u && z <= old_z)) return;
-        }
-    } else {
-        write_z = 0;
-    }
-    if (write_frame) {
-        if ((prim & 64u) && (!(REG_X(st, 73) & 1u) || (color.a & 128))) {
-            uint32_t alpha = REG_X(st, 66 + ctxt);
-            uint32_t sa = alpha & 3u, sb = (alpha >> 2) & 3u, sc = (alpha >> 4) & 3u, sd = (alpha >> 6) & 3u;
-            Color zero = {0, 0, 0, 0};
-            Color av = sa == 0u ? color : sa == 1u ? dst : zero;
-            Color bv = sb == 0u ? color : sb == 1u ? dst : zero;
-            int32_t cv = sc == 0u ? color.a : sc == 1u ? dst.a : (int32_t)(REG_Y(st, 66 + ctxt) & 255u);
-            Color dv = sd == 0u ? color : sd == 1u ? dst : zero;
-            color.r = (((av.r - bv.r) * cv) >> 7) + dv.r;
-            color.g = (((av.g - bv.g) * cv) >> 7) + dv.g;
-            color.b = (((av.b - bv.b) * cv) >> 7) + dv.b;
-        }
-        if ((psm & 7u) == 2u && (REG_X(st, 69) & 1u)) {
-            uint32_t index = (y & 3u) * 4u + (x & 3u);
-            uint32_t word = st->reg[68][index >> 3];
-            int32_t dither = (int32_t)(((word >> ((index & 7u) * 4u)) & 7u) << 29) >> 29;
-            color.r += dither; color.g += dither; color.b += dither;
-        }
-        if (REG_X(st, 70) & 1u) color = clamp_color(color);
-        else { color.r &= 255; color.g &= 255; color.b &= 255; color.a &= 255; }
-        if (REG_X(st, 74 + ctxt) & 1u) color.a |= 128;
-        uint32_t mask = REG_Y(st, 76 + ctxt) | (rgb_only ? 0xFF000000u : 0u);
-        uint32_t value = pack32(color);
-        if ((psm & 7u) == 2u) { value = pack16(value); mask = pack16(mask); }
-        write_pixel(memory, psm, bp, bw, x, y, value, mask);
-    }
-    if (write_z) write_pixel(memory, zpsm, zbp, bw, x, y, z, 0u);
-}
+#define RC_CAS(p, expected, desired) rc_cas((p), (expected), (desired))
+static inline int32_t rc_abs(int32_t v) { return v < 0 ? -v : v; }
+#include "raster_core.h"
 
 /* raster.wgsl's main for one touched tile: its primitives in submission order, each over the
    tile's pixels inside its box (pixels of one batch are independent, so the order between pixels
@@ -546,43 +122,15 @@ static void draw_tile(Cpu *cpu, uint32_t entry)
     for (uint32_t i = 0; i < count; i++) {
         const Primitive *d = &cpu->e.primitive_data[bins[first + i]];
         const Constants *st = &cpu->e.state_data[d->info[3]];
-        uint32_t left = x0 > d->bounds[0] ? x0 : d->bounds[0];
-        uint32_t top = y0 > d->bounds[1] ? y0 : d->bounds[1];
-        uint32_t right = d->bounds[0] + d->bounds[2], bottom = d->bounds[1] + d->bounds[3];
-        if (right > x0 + 8u) right = x0 + 8u;
-        if (bottom > y0 + 8u) bottom = y0 + 8u;
-        Setup setup = {0.0f, 1};
-        int32_t ax = (int32_t)d->position[0][0], ay = (int32_t)d->position[0][1];
-        int32_t bx = (int32_t)d->position[1][0], by = (int32_t)d->position[1][1];
-        int32_t box[4] = {(int32_t)left, (int32_t)top, (int32_t)right, (int32_t)bottom};
-        uint32_t type = d->info[0];
-        if (type == 0u) {
-            /* a point: its one pixel */
-            box[0] = ax >> 4; box[1] = ay >> 4; box[2] = box[0] + 1; box[3] = box[1] + 1;
-        } else if (type == 6u) {
-            /* a sprite covers the pixels whose centres p * 16 lie in [min, max) */
-            int32_t lx = ax < bx ? ax : bx, hx = ax < bx ? bx : ax, ly = ay < by ? ay : by, hy = ay < by ? by : ay;
-            box[0] = (lx + 15) >> 4; box[1] = (ly + 15) >> 4; box[2] = (hx + 15) >> 4; box[3] = (hy + 15) >> 4;
-        } else if (type != 1u && type != 2u) {
-            /* a triangle: the pixels in [min, max] of its vertices, and nothing at a zero area */
-            int32_t cx = (int32_t)d->position[2][0], cy = (int32_t)d->position[2][1];
-            int32_t lx = ax, hx = ax, ly = ay, hy = ay;
-            if (bx < lx) lx = bx; if (cx < lx) lx = cx; if (bx > hx) hx = bx; if (cx > hx) hx = cx;
-            if (by < ly) ly = by; if (cy < ly) ly = cy; if (by > hy) hy = by; if (cy > hy) hy = cy;
-            setup.area = edge(ax, ay, bx, by, cx, cy);
-            if (setup.area == 0.0f) continue;
-            setup.sign = setup.area > 0.0f ? 1 : -1;
-            box[0] = (lx + 15) >> 4; box[1] = (ly + 15) >> 4; box[2] = (hx >> 4) + 1; box[3] = (hy >> 4) + 1;
-        }
-        if (type != 1u && type != 2u) {
-            if (box[0] < (int32_t)left) box[0] = (int32_t)left;
-            if (box[1] < (int32_t)top) box[1] = (int32_t)top;
-            if (box[2] > (int32_t)right) box[2] = (int32_t)right;
-            if (box[3] > (int32_t)bottom) box[3] = (int32_t)bottom;
-        }
+        Setup setup;
+        int32_t box[4];
+        if (!prim_box(d, x0, y0, &setup, box)) continue;
         for (int32_t y = box[1]; y < box[3]; y++)
             for (int32_t x = box[0]; x < box[2]; x++)
-                draw_pixel(cpu->vram, cpu->snapshot, d, st, &setup, (uint32_t)x, (uint32_t)y);
+            {
+                PixelCache cache = {{0, 0}, {0, 0}};
+                draw_pixel(cpu->vram, cpu->snapshot, d, st, &setup, &cache, (uint32_t)x, (uint32_t)y);
+            }
     }
 }
 
@@ -758,13 +306,6 @@ static void run_local_copy(Cpu *cpu, const uint32_t c[12])
 }
 
 /* raster.wgsl's scanout: the display circuit's picture (VRAM itself) into the screen image. */
-static uint32_t scan_pixel(Cpu *cpu, const uint32_t c[12], uint32_t x, uint32_t y)
-{
-    uint32_t v = read_pixel(cpu->vram, c[0], c[1], c[2], (c[3] + x) & 2047u, (c[4] + y) & 2047u);
-    if (c[0] == 2u || c[0] == 10u) v = ((v & 31u) << 3) | ((v & 0x3E0u) << 6) | ((v & 0x7C00u) << 9);
-    return (v & 0xFFFFFFu) | 0xFF000000u;
-}
-
 /* raster.wgsl's scanout: the display circuit's picture (VRAM itself) into the screen image.
 
    Field mode (c[7]: interlaced, one field's lines in the frame buffer, each shown twice): the game
@@ -772,22 +313,19 @@ static uint32_t scan_pixel(Cpu *cpu, const uint32_t c[12], uint32_t x, uint32_t 
    each other. A progressive screen shows that as the picture jumping a line up and down every
    field. So a field is shown one line lower when that matches the picture before it better
    (sampled differences of the green channel; a tie keeps the last choice), which keeps it still. */
-static void run_scanout(Cpu *cpu, const uint32_t c[12], uint32_t width, uint32_t height)
+/* The scanout's source lines: a field's (c[7]) or the whole picture's. */
+static uint32_t scan_lines(const uint32_t c[12]) { return c[7] ? (c[6] + 1) / 2 : c[6]; }
+
+/* The screen image from the scanned lines in cpu->field (see run_scanout). */
+static void compose_scanout(Cpu *cpu, const uint32_t c[12], uint32_t width, uint32_t height)
 {
     static int shift;  /* the last field's: 0, or 1 = shown one line lower */
+    uint32_t lines = scan_lines(c);
     if (!c[7]) {
-        for (uint32_t y = 0; y < height; y++) {
-            uint32_t *row = cpu->screen + (size_t)y * width;
-            for (uint32_t x = 0; x < width; x++) row[x] = scan_pixel(cpu, c, x, y);
-        }
+        memcpy(cpu->screen, cpu->field, (size_t)width * height * 4);
         cpu->screen_width = width;
         cpu->screen_height = height;
         return;
-    }
-    uint32_t lines = (height + 1) / 2;
-    for (uint32_t y = 0; y < lines; y++) {
-        uint32_t *row = cpu->field + (size_t)y * width;
-        for (uint32_t x = 0; x < width; x++) row[x] = scan_pixel(cpu, c, x, y);
     }
     if (cpu->screen_width == width && cpu->screen_height == height && height >= 32) {
         uint64_t cost[2] = {0, 0};
@@ -810,6 +348,16 @@ static void run_scanout(Cpu *cpu, const uint32_t c[12], uint32_t width, uint32_t
     }
     cpu->screen_width = width;
     cpu->screen_height = height;
+}
+
+static void run_scanout(Cpu *cpu, const uint32_t c[12], uint32_t width, uint32_t height)
+{
+    uint32_t lines = scan_lines(c);
+    for (uint32_t y = 0; y < lines; y++) {
+        uint32_t *row = cpu->field + (size_t)y * width;
+        for (uint32_t x = 0; x < width; x++) row[x] = scan_pixel(cpu->vram, c, x, y);
+    }
+    compose_scanout(cpu, c, width, height);
 }
 
 /* ---- the device ops ---- */
@@ -849,9 +397,32 @@ static int op_record(Exact *gpu, int pipeline, uint32_t x, uint32_t y)
     return 1;
 }
 
+static void gpu_submit(Cpu *cpu);
+static struct {
+    int on;
+    GnmKernel raster, copy, local_copy, scanout;
+    uint64_t dispatches, waits;
+    /* the arenas' GPU copies in garlic memory: the front end keeps its own in cached memory, which
+       it reads back as it builds them; a submit copies the used parts over (sequential writes) */
+    Primitive *primitives;
+    Constants *states;
+    uint32_t *bins, *batches;
+    /* experiments, from files in /data/dhd: gpu_no_raster (no batch dispatches), gpu_no_barrier
+       (no barriers: wrong pictures, for timing only), gpu_no_pixels (the raster kernel's mode 1) */
+    int no_raster, no_barrier, no_pixels;
+    /* the profile (gpu_submit, one submit in every 10 s line): GPU time per kind, the slowest batches */
+    int profile_next;
+    uint64_t kind_ticks[5], kind_count[5];
+    struct { uint64_t ticks; uint32_t tiles, members, primitives, types[8]; } slow[4];
+} device;
+
+/* the profiled submit's dispatches: kind, tiles, list members, primitive types (GPU thread only) */
+static struct { int kind; uint32_t tiles, members, types[8]; } profile_marks[4000];
+
 static void op_submit(Exact *gpu)
 {
     Cpu *cpu = (Cpu *)gpu;
+    if (device.on) { gpu_submit(cpu); return; }
     uint64_t start = sceKernelGetProcessTime();
     for (unsigned i = 0; i < cpu->command_count; i++) {
         const Command *c = &cpu->commands[i];
@@ -887,6 +458,209 @@ static void op_submit(Exact *gpu)
     }
     cpu->command_count = 0;
     cpu->raster_ticks += sceKernelGetProcessTime() - start;
+}
+
+
+/* ---- the GPU device (port/ps4/gnm.c, port/ps4/kernels/raster.cl) ----
+
+   The same commands as the CPU's, each one dispatch of raster.cl's kernels, with a barrier after
+   each (a batch draws over the last one's pixels; WebGPU's passes order their dispatches the same
+   way); a submit is one command buffer, waited for. VRAM, the texture snapshot and the upload pages
+   are garlic memory (the GPU's fast path; the CPU only writes the upload pages); what the CPU reads
+   (the readback and staging pages, the scanned lines, the front end's arenas) is onion memory. */
+
+static void gpu_copy(Cpu *cpu, const void *from, void *to, uint32_t bytes)
+{
+    (void)cpu;
+    struct { uint64_t from, to; uint32_t words, stride; } a;
+    uint32_t words = bytes / 4, groups = (words + 63) / 64;
+    if (groups > 1024) groups = 1024;
+    a.from = (uint64_t)(uintptr_t)from; a.to = (uint64_t)(uintptr_t)to; a.words = words; a.stride = groups * 64u;
+    gnm_dispatch(&device.copy, &a, sizeof a, groups, 1, 64, 1);
+}
+
+static void gpu_submit(Cpu *cpu)
+{
+    uint64_t start = sceKernelGetProcessTime();
+    const uint32_t *scanout = NULL;
+    Exact *e = &cpu->e;
+    int profile = device.profile_next && cpu->command_count >= 20 && cpu->command_count < 4000;
+    if (profile) device.profile_next = 0;
+    memset(profile_marks, 0, sizeof profile_marks);
+    memcpy(device.primitives, e->primitive_data, e->primitive_count * sizeof(Primitive));
+    memcpy(device.states, e->state_data, e->state_count * sizeof(Constants));
+    memcpy(device.bins, e->bin_data, (size_t)e->bin_words * 4);
+    memcpy(device.batches, e->batch_data, (size_t)e->batch_count * BATCH_STRIDE);
+    gnm_begin();
+    unsigned dispatched = 0;
+    for (unsigned i = 0; i < cpu->command_count; i++) {
+        const Command *c = &cpu->commands[i];
+        if (!gnm_room()) {  /* a full buffer goes now; the rest follow in another */
+            profile = 0;
+            if (!gnm_finish()) break;
+            gnm_begin();
+        }
+        if (profile && dispatched == 0) gnm_mark(0);
+        uint32_t profile_tiles = 0, profile_members = 0;
+        switch (c->kind) {
+        case CMD_COPY:
+            gpu_copy(cpu, buffer_base(cpu, c->from) + c->from_offset, buffer_base(cpu, c->to) + c->to_offset, c->bytes);
+            break;
+        case CMD_SNAPSHOT:
+            cpu->snapshots++;
+            for (unsigned page = 0; page < 512;) {
+                if (!(c->pages[page / 32] >> (page & 31) & 1)) { page++; continue; }
+                unsigned end = page;
+                while (end < 512 && c->pages[end / 32] >> (end & 31) & 1) end++;
+                gpu_copy(cpu, (uint8_t *)cpu->vram + page * 8192, (uint8_t *)cpu->snapshot + page * 8192, (end - page) * 8192);
+                cpu->snapshot_pages += end - page;
+                page = end;
+            }
+            break;
+        case CMD_BATCH: {
+            const uint32_t *header = cpu->e.batch_data + c->offset / 4;
+            uint32_t touched = header[0];
+            if (!touched) continue;
+            if (device.no_raster) continue;
+            struct { uint64_t bins, primitives, states, vram, snapshot; uint32_t touched, base, columns, mode; } a;
+            uint32_t columns = touched < 32768u ? touched : 32768u;
+            a.bins = (uint64_t)(uintptr_t)device.bins;
+            a.primitives = (uint64_t)(uintptr_t)device.primitives;
+            a.states = (uint64_t)(uintptr_t)device.states;
+            a.vram = (uint64_t)(uintptr_t)cpu->vram;
+            a.snapshot = (uint64_t)(uintptr_t)cpu->snapshot;
+            a.touched = touched; a.base = header[1]; a.columns = columns; a.mode = device.no_pixels ? 1u : 0u;
+            gnm_dispatch(&device.raster, &a, sizeof a, columns, (touched + columns - 1) / columns, 8, 8);
+            if (profile) {
+                profile_tiles = touched;
+                for (uint32_t t = 0; t < touched; t++) {
+                    uint32_t first = e->bin_data[header[1] + t * 3u + 1], count = e->bin_data[header[1] + t * 3u + 2];
+                    profile_members += count;
+                    for (uint32_t q = 0; q < count; q++)
+                        profile_marks[dispatched].types[e->primitive_data[e->bin_data[first + q]].info[0] & 7u]++;
+                }
+            }
+            cpu->tiles += touched;
+            cpu->batches++;
+            break;
+        }
+        case CMD_LOCAL_COPY: {
+            struct { uint64_t vram; uint32_t c[12]; } a;
+            a.vram = (uint64_t)(uintptr_t)cpu->vram;
+            memcpy(a.c, c->c, sizeof a.c);
+            gnm_dispatch(&device.local_copy, &a, sizeof a, (c->c[8] + 7) / 8, (c->c[9] + 7) / 8, 8, 8);
+            break;
+        }
+        case CMD_SCANOUT: {
+            struct { uint64_t vram, out; uint32_t c[12]; uint32_t lines; } a;
+            a.vram = (uint64_t)(uintptr_t)cpu->vram;
+            a.out = (uint64_t)(uintptr_t)cpu->field;
+            memcpy(a.c, c->c, sizeof a.c);
+            a.lines = scan_lines(c->c);
+            gnm_dispatch(&device.scanout, &a, sizeof a, (c->c[5] + 7) / 8, (a.lines + 7) / 8, 8, 8);
+            scanout = c->c;
+            break;
+        }
+        }
+        if (!device.no_barrier) gnm_barrier();
+        if (profile) {
+            profile_marks[dispatched].kind = c->kind;
+            profile_marks[dispatched].tiles = profile_tiles;
+            profile_marks[dispatched].members = profile_members;
+            gnm_mark(dispatched + 1);
+        }
+        dispatched++;
+    }
+    int ok = gnm_finish();
+    device.dispatches += dispatched;
+    device.waits++;
+    if (!ok) {
+        /* the GPU stopped answering (gnm.c logged it): the CPU draws from here on */
+        fprintf(stderr, "gs: the GPU device failed; drawing on the CPU from now on\n");
+        device.on = 0;
+        op_submit(&cpu->e);
+        return;
+    }
+    if (profile && dispatched) {
+        for (unsigned k = 0; k < dispatched; k++) {
+            uint64_t t = gnm_mark_time(k + 1) - gnm_mark_time(k);
+            int kind = profile_marks[k].kind;
+            device.kind_ticks[kind] += t;
+            device.kind_count[kind]++;
+            if (kind != CMD_BATCH) continue;
+            for (int r = 0; r < 4; r++)
+                if (t > device.slow[r].ticks) {
+                    for (int q = 3; q > r; q--) device.slow[q] = device.slow[q - 1];
+                    device.slow[r].ticks = t;
+                    device.slow[r].tiles = profile_marks[k].tiles;
+                    device.slow[r].members = profile_marks[k].members;
+                    memcpy(device.slow[r].types, profile_marks[k].types, sizeof device.slow[r].types);
+                    break;
+                }
+        }
+        static const char *names[5] = {"copy", "snapshot", "batch", "local copy", "scanout"};
+        char line[1024];
+        int n = snprintf(line, sizeof line, "gs gpu profile: one submit of %u dispatches:", dispatched);
+        for (int kind = 0; kind < 5; kind++)
+            if (device.kind_count[kind])
+                n += snprintf(line + n, sizeof line - n, " %s %u x %.2f ms", names[kind], (unsigned)device.kind_count[kind],
+                              device.kind_ticks[kind] / 1e5);
+        n += snprintf(line + n, sizeof line - n, "; slowest batches:");
+        for (int r = 0; r < 4 && device.slow[r].ticks; r++)
+            n += snprintf(line + n, sizeof line - n, " %.2f ms (%u tiles, %u in lists; types 0-6: %u %u %u %u %u %u %u)",
+                          device.slow[r].ticks / 1e5, device.slow[r].tiles, device.slow[r].members,
+                          device.slow[r].types[0], device.slow[r].types[1], device.slow[r].types[2], device.slow[r].types[3],
+                          device.slow[r].types[4], device.slow[r].types[5], device.slow[r].types[6]);
+        fprintf(stderr, "%s\n", line);
+        memset(device.kind_ticks, 0, sizeof device.kind_ticks);
+        memset(device.kind_count, 0, sizeof device.kind_count);
+        memset(device.slow, 0, sizeof device.slow);
+    }
+    if (scanout) compose_scanout(cpu, scanout, scanout[5], scanout[6]);
+    cpu->command_count = 0;
+    cpu->raster_ticks += sceKernelGetProcessTime() - start;
+}
+
+/* The device's memory and kernels; 0 leaves the CPU device. Its arenas replace exact_alloc's. */
+static int gpu_device_start(Cpu *cpu)
+{
+    if (!gnm_init()) return 0;
+    if (!gnm_kernel("raster", &device.raster) || !gnm_kernel("copy_words", &device.copy) ||
+        !gnm_kernel("local_copy", &device.local_copy) || !gnm_kernel("scanout", &device.scanout)) {
+        fprintf(stderr, "gs: the GPU kernels are missing\n");
+        return 0;
+    }
+    uint32_t *vram = gnm_alloc_garlic(GS_VRAM_SIZE, 65536), *snapshot = gnm_alloc_garlic(GS_VRAM_SIZE, 65536);
+    uint32_t *upload = gnm_alloc_garlic(GS_VRAM_SIZE, 65536);
+    uint32_t *readback = gnm_alloc(GS_VRAM_SIZE, 65536), *staged = gnm_alloc(GS_VRAM_SIZE, 65536);
+    uint32_t *screen = gnm_alloc(1024 * 1024 * 4, 65536), *field = gnm_alloc(1024 * 1024 * 4, 65536);
+    Primitive *primitives = gnm_alloc_garlic(MAX_PRIMITIVES * sizeof(Primitive), 256);
+    Constants *states = gnm_alloc_garlic(MAX_STATES * sizeof(Constants), 256);
+    uint32_t *bins = gnm_alloc_garlic(MAX_BIN_WORDS * 4, 256), *batches = gnm_alloc_garlic(MAX_BATCHES * BATCH_STRIDE, 256);
+    if (!vram || !snapshot || !upload || !readback || !staged || !screen || !field || !primitives || !states ||
+        !bins || !batches) {
+        fprintf(stderr, "gs: not enough GPU memory for the GPU device\n");
+        return 0;
+    }
+    memset(vram, 0, GS_VRAM_SIZE); memset(snapshot, 0, GS_VRAM_SIZE); memset(upload, 0, GS_VRAM_SIZE);
+    memset(readback, 0, GS_VRAM_SIZE); memset(staged, 0, GS_VRAM_SIZE);
+    memset(screen, 0, 1024 * 1024 * 4); memset(field, 0, 1024 * 1024 * 4);
+    memset(batches, 0, MAX_BATCHES * BATCH_STRIDE);
+    device.primitives = primitives; device.states = states; device.bins = bins; device.batches = batches;
+    cpu->vram = vram; cpu->snapshot = snapshot; cpu->upload = upload; cpu->readback = readback; cpu->staged = staged;
+    cpu->screen = screen; cpu->field = field;
+    fprintf(stderr, "gs: GPU renderer (raster %u VGPRs; arguments %u/%u bytes)\n",
+            ((device.raster.rsrc1 & 63u) + 1u) * 4u, (unsigned)sizeof(struct { uint64_t p[5]; uint32_t u[3]; }),
+            device.raster.kernarg_size);
+    struct stat st;
+    device.no_raster = stat("/data/dhd/gpu_no_raster", &st) == 0;
+    device.no_barrier = stat("/data/dhd/gpu_no_barrier", &st) == 0;
+    device.no_pixels = stat("/data/dhd/gpu_no_pixels", &st) == 0;
+    if (device.no_raster || device.no_barrier || device.no_pixels)
+        fprintf(stderr, "gs: GPU experiment:%s%s%s\n", device.no_raster ? " no raster" : "",
+                device.no_barrier ? " no barriers" : "", device.no_pixels ? " no pixels" : "");
+    device.on = 1;
+    return 1;
 }
 
 static void op_read(Exact *gpu, int buffer, const uint32_t want[16], void *image)
@@ -1017,15 +791,21 @@ int gs_gpu_init(Gs *g)
     Cpu *cpu = calloc(1, sizeof *cpu);
     if (!cpu) return 0;
     g->backend = cpu;
-    cpu->vram = calloc(1, GS_VRAM_SIZE);
-    cpu->snapshot = calloc(1, GS_VRAM_SIZE);
-    cpu->readback = calloc(1, GS_VRAM_SIZE);
-    cpu->staged = calloc(1, GS_VRAM_SIZE);
-    cpu->upload = calloc(1, GS_VRAM_SIZE);
-    cpu->screen = calloc(1024 * 1024, 4);
-    cpu->field = calloc(1024 * 1024, 4);
-    if (!cpu->vram || !cpu->snapshot || !cpu->readback || !cpu->staged || !cpu->upload || !cpu->screen || !cpu->field ||
-        !exact_alloc(&cpu->e)) {
+    if (!exact_alloc(&cpu->e)) {
+        fprintf(stderr, "gs: out of memory for the renderer\n");
+        gs_gpu_destroy(g);
+        return 0;
+    }
+    if (!gpu_device_start(cpu)) {
+        cpu->vram = calloc(1, GS_VRAM_SIZE);
+        cpu->snapshot = calloc(1, GS_VRAM_SIZE);
+        cpu->readback = calloc(1, GS_VRAM_SIZE);
+        cpu->staged = calloc(1, GS_VRAM_SIZE);
+        cpu->upload = calloc(1, GS_VRAM_SIZE);
+        cpu->screen = calloc(1024 * 1024, 4);
+        cpu->field = calloc(1024 * 1024, 4);
+    }
+    if (!cpu->vram || !cpu->snapshot || !cpu->readback || !cpu->staged || !cpu->upload || !cpu->screen || !cpu->field) {
         fprintf(stderr, "gs: out of memory for the CPU renderer\n");
         gs_gpu_destroy(g);
         return 0;
@@ -1033,8 +813,7 @@ int gs_gpu_init(Gs *g)
     const char *limit = getenv("DHD_GS_BATCH");
     exact_config(&cpu->e, getenv("DHD_PROFILE") != NULL, limit ? strtoul(limit, NULL, 0) : 0);
     exact_hooks(g, &cpu->e);
-    if (!pool.workers) pool_start();
-    gnm_init();  /* the GPU path's check (port/ps4/gnm.c): its result goes to the log */
+    if (!device.on && !pool.workers) pool_start();
     return 1;
 }
 
@@ -1046,9 +825,12 @@ void gs_gpu_destroy(Gs *g)
         sync_vram(g);
         if (cpu->e.recorded) submit_all(&cpu->e);
     }
+    if (!device.on) {  /* the GPU device's buffers are the pool's, kept for the next renderer */
+        free(cpu->vram); free(cpu->snapshot); free(cpu->readback); free(cpu->staged); free(cpu->upload);
+        free(cpu->screen); free(cpu->field);
+    }
     exact_free(&cpu->e);
-    free(cpu->vram); free(cpu->snapshot); free(cpu->readback); free(cpu->staged); free(cpu->upload);
-    free(cpu->screen); free(cpu->field); free(cpu->commands);
+    free(cpu->commands);
     free(cpu);
     g->backend = NULL; g->draw = NULL; g->sync = NULL; g->sync_range = NULL;
     g->local_copy = NULL; g->stage_pages = NULL; g->fetch_pages = NULL;
@@ -1092,11 +874,17 @@ int gs_gpu_display(Gs *g, unsigned *width, unsigned *height)
     if (cpu && !since) since = now;
     else if (cpu && now - since >= 10000000) {
         double seconds = (now - since) / 1e6;
-        fprintf(stderr, "gs cpu: %.1f fields/s, %.0f draws/s, %.0f batches/s, %.0f tiles/s, raster %.0f ms/s, "
-                "%.1f snapshots/s (%.0f pages/s), %.1f uploads/s, %.1f local copies/s\n",
-                fields / seconds, cpu->e.draws / seconds, cpu->batches / seconds, cpu->tiles / seconds,
+        fprintf(stderr, "gs %s: %.1f fields/s, %.0f draws/s, %.0f batches/s, %.0f tiles/s, raster %.0f ms/s, "
+                "%.1f snapshots/s (%.0f pages/s), %.1f uploads/s, %.1f local copies/s, %.1f submits/s, "
+                "GPU wait %.0f ms/s (GPU clock %.0f Mticks/s), %.1f readbacks/s, %.0f dispatches/s\n",
+                device.on ? "gpu" : "cpu", fields / seconds, cpu->e.draws / seconds, cpu->batches / seconds, cpu->tiles / seconds,
                 cpu->raster_ticks / 1000.0 / seconds, cpu->snapshots / seconds, cpu->snapshot_pages / seconds,
-                cpu->e.uploads / seconds, cpu->e.copies / seconds);
+                cpu->e.uploads / seconds, cpu->e.copies / seconds, gnm_submits / seconds, gnm_wait_us / 1000.0 / seconds,
+                gnm_gpu_ticks / 1e6 / seconds, cpu->e.reads / seconds, device.dispatches / seconds);
+        gnm_submits = gnm_wait_us = gnm_gpu_ticks = 0;
+        device.profile_next = 1;
+        device.dispatches = 0;
+        cpu->e.reads = 0;
         cpu->e.draws = cpu->e.uploads = cpu->e.copies = 0;
         cpu->batches = cpu->tiles = cpu->raster_ticks = cpu->snapshots = cpu->snapshot_pages = 0;
         since = now; fields = 0;

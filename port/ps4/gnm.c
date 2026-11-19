@@ -43,7 +43,25 @@ static struct {
     uint32_t fence_value;
     uint8_t *zero;                 /* 64 zero bytes for user SGPRs a kernel takes but never reads */
     volatile uint32_t *marks;      /* garlic (uncached for the CPU): the fence and the start marks */
+    uint8_t *garlic;               /* the garlic pool: marks first, then gnm_alloc_garlic's */
+    size_t garlic_used;
 } gnm;
+
+#define GARLIC_SIZE (64u << 20)
+
+void *gnm_alloc_garlic(size_t size, size_t align)
+{
+    size_t at = (gnm.garlic_used + align - 1) & ~(align - 1);
+    if (!gnm.garlic || at + size > GARLIC_SIZE) return NULL;
+    gnm.garlic_used = at + size;
+    return gnm.garlic + at;
+}
+
+uint64_t gnm_wait_us, gnm_submits, gnm_gpu_ticks;
+
+/* the GPU's clock into marks[8 + 2 * slot] once everything before it in the buffer is done */
+static void emit(uint32_t word);
+static void timestamp(unsigned slot);
 
 void *gnm_alloc(size_t size, size_t align)
 {
@@ -65,8 +83,10 @@ int gnm_kernel(const char *name, GnmKernel *k)
         memcpy(&k->rsrc2, d + 52, 4);
         memcpy(&k->properties, d + 56, 2);
         k->entry = (uint64_t)(uintptr_t)d + (uint64_t)entry_offset;
-        uint32_t scratch;
+        uint32_t scratch, lds;
         memcpy(&scratch, d + 4, 4);
+        memcpy(&lds, d, 4);
+        k->rsrc2 |= ((lds + 511) / 512) << 15;  /* LDS_SIZE, bits 15-23 */
         if (scratch || (k->entry & 255)) {
             fprintf(stderr, "gnm: kernel %s needs scratch memory (%u bytes) or is misplaced\n", name, scratch);
             return 0;
@@ -112,6 +132,7 @@ void gnm_begin(void)
     acquire_mem();
     static const uint32_t start[3] = {0, 0, 0};
     set_sh(COMPUTE_START_X, start, 3);
+    timestamp(0);
     /* WRITE_DATA (memory, write confirmed, by the ME): the buffer's number into marks[1], so a
        buffer the GPU never finished still shows whether it began */
     uint64_t mark = (uint64_t)(uintptr_t)&gnm.marks[1];
@@ -154,9 +175,27 @@ int gnm_dispatch(const GnmKernel *k, const void *args, uint32_t size, uint32_t g
     return 1;
 }
 
+/* Between dispatches that depend on each other: the earlier ones finished, and the shader L1 and
+   K caches invalidated, so the next reads what they wrote (in the L2, shared by every CU). */
+void gnm_barrier(void)
+{
+    emit(PKT3(IT_EVENT_WRITE, 1, 0));
+    emit(7u | (4u << 8));  /* CS_PARTIAL_FLUSH */
+    emit(PKT3(IT_ACQUIRE_MEM, 6, 0));
+    emit((1u << 27) | (1u << 22));  /* SH_KCACHE, TCL1 */
+    emit(0xFFFFFFFFu);
+    emit(0xFFu);
+    emit(0);
+    emit(0);
+    emit(0x0000000Au);
+}
+
+int gnm_room(void) { return gnm.count + 256 < COMMAND_WORDS && gnm.argument_used + 4096 < ARGUMENT_BYTES; }
+
 int gnm_finish(void)
 {
     /* the dispatches done, their writes in memory, then the fence */
+    timestamp(1);
     emit(PKT3(IT_EVENT_WRITE, 1, 0));  /* one body word: the event */
     emit(7u | (4u << 8));  /* CS_PARTIAL_FLUSH */
     acquire_mem();
@@ -176,6 +215,7 @@ int gnm_finish(void)
             fprintf(stderr, "\n");
         }
     }
+    __builtin_ia32_sfence();  /* the CPU's write-combined (garlic) writes reach memory before the GPU reads */
     const uint32_t *dcb[1] = {gnm.commands};
     uint32_t bytes[1] = {gnm.count * 4};
     int32_t rc = sceGnmSubmitCommandBuffers(1, dcb, bytes, NULL, NULL);
@@ -192,9 +232,38 @@ int gnm_finish(void)
             gnm.failed = 1;
             return 0;
         }
-        sceKernelUsleep(20);
+        /* spin: the GPU's work takes micro- to milliseconds, and a sleep on the console lasts far
+           longer than asked (a field's dozens of waits slept away most of it) */
+        __builtin_ia32_pause();
     }
+    gnm_wait_us += sceKernelGetProcessTime() - start;
+    gnm_submits++;
+    uint64_t t0 = gnm.marks[8] | (uint64_t)gnm.marks[9] << 32, t1 = gnm.marks[10] | (uint64_t)gnm.marks[11] << 32;
+    if (t1 > t0) gnm_gpu_ticks += t1 - t0;
     return 1;
+}
+
+static void timestamp(unsigned slot)
+{
+    uint64_t at = (uint64_t)(uintptr_t)&gnm.marks[8 + 2 * slot];
+    emit(PKT3(IT_EVENT_WRITE_EOP, 5, 0));
+    emit(0x28u | (5u << 8));  /* BOTTOM_OF_PIPE_TS */
+    emit((uint32_t)at);
+    emit(((uint32_t)(at >> 32) & 0xFFFFu) | (3u << 29));  /* DATA_SEL 3: the GPU's 64-bit clock */
+    emit(0);
+    emit(0);
+}
+
+/* Profile marks: the GPU's clock after the work so far, into marks[64 + 2 * index] (up to 4096). */
+void gnm_mark(unsigned index)
+{
+    if (index < 4096) timestamp(28 + index);
+}
+
+uint64_t gnm_mark_time(unsigned index)
+{
+    volatile uint32_t *m = &gnm.marks[8 + 2 * (28 + index)];
+    return m[0] | (uint64_t)m[1] << 32;
 }
 
 void gnm_frame_done(void)
@@ -245,12 +314,14 @@ int gnm_init(void)
     }
     off_t marks_offset;
     void *marks = NULL;
-    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), 2u << 20, 2u << 20, 3, &marks_offset) != 0 ||
-        sceKernelMapDirectMemory(&marks, 2u << 20, 0x33, 0, marks_offset, 2u << 20) != 0) {
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), GARLIC_SIZE, 2u << 20, 3, &marks_offset) != 0 ||
+        sceKernelMapDirectMemory(&marks, GARLIC_SIZE, 0x33, 0, marks_offset, 2u << 20) != 0) {
         fprintf(stderr, "gnm: no garlic memory\n");
         return 0;
     }
     gnm.marks = marks;
+    gnm.garlic = marks;
+    gnm.garlic_used = 65536;  /* the marks: fence, start mark, timestamps (profile: 4096 of them) */
     gnm.marks[0] = gnm.marks[1] = 0;
     extern int32_t sceGnmAreSubmitsAllowed(void);
     fprintf(stderr, "gnm: submits allowed: %d\n", sceGnmAreSubmitsAllowed());
