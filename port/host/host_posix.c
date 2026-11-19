@@ -57,6 +57,11 @@ unsigned host_exe_path(char *out, unsigned size)
     const char *android_exe_path(void);
     int k = snprintf(out, size, "%s", android_exe_path());
     return k > 0 && (unsigned)k < size ? (unsigned)k : 0;
+#elif defined(__ORBIS__)
+    /* PS4: the app's files live in /data/dhd/ (the package is read-only), which stands for the
+       executable's folder: dhd.ini, saves, dhd.log and the disc image */
+    int k = snprintf(out, size, "/data/dhd/dhd64");
+    return k > 0 && (unsigned)k < size ? (unsigned)k : 0;
 #elif defined(__APPLE__)
 #if TARGET_OS_IPHONE
     /* iOS: the app's Documents folder stands for the executable's (dhd.ini, saves, dhd.log) */
@@ -193,6 +198,7 @@ static struct sigaction guard_old_segv, guard_old_bus;
 static pthread_mutex_t guard_installed_lock = PTHREAD_MUTEX_INITIALIZER;
 static int guard_installed;
 
+#ifndef __ORBIS__
 static void guard_fault(int sig, siginfo_t *info, void *ctx)
 {
     uintptr_t host = (uintptr_t)info->si_addr;
@@ -223,8 +229,16 @@ static void guard_fault(int sig, siginfo_t *info, void *ctx)
     }
 }
 
+#endif
+
 int host_fault_guard(int (*on_fault)(uint32_t address))
 {
+#ifdef __ORBIS__
+    /* PS4: no SA_SIGINFO handler in the console's libc; graphics.c then reads its packets at once
+       (no deferred reads), as its tests do */
+    (void)on_fault;
+    return 0;
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = guard_fault;
@@ -242,6 +256,7 @@ int host_fault_guard(int (*on_fault)(uint32_t address))
     guard_on_fault = on_fault;
     guard_armed = 1;
     return 1;
+#endif
 }
 
 int host_fault_guard_here(void) { return guard_armed; }

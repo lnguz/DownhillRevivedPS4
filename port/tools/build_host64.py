@@ -74,6 +74,7 @@ class Target:
         self.flags, self.wabt, self.simde = list(flags), Path(os.environ.get('WABT_DIR') or wabt), simde
         self.windows, self.android, self.mac = key == 'win-x64', key == 'android-arm64', key == 'macos-arm64'
         self.ios = key.startswith('ios-')  # a static library the Xcode app links (port/ios, finding 224)
+        self.ps4 = key == 'ps4'  # PlayStation 4 (OpenOrbis, jailbroken console): port/ps4
         self.posix = not self.windows
 
 
@@ -81,6 +82,11 @@ MAC_MIN = '11.0'  # the first macOS on Apple silicon (package_release.py's LSMin
 ANDROID_API = 29  # sdl3.ANDROID_API: Android 10 (finding 191)
 IOS_MIN = '17.0'  # sdl3.IOS_MIN and port/ios/project/Info.plist's MinimumOSVersion
 IOS_CPU = 'apple-a12'  # docs/PLAYING.md's minimum chip (iPhone XS/XR, iPad 8th gen); port/ios/cpu_floor.py checks it
+# PlayStation 4: OpenOrbis's sysroot with LLVM's clang and lld (port/ps4/PLAN.md); the CPU is AMD Jaguar
+PS4_SDK = Path(os.environ.get('OO_PS4_TOOLCHAIN') or Path.home() / 'ps4dev/OpenOrbis/PS4Toolchain')
+PS4_FLAGS = ['--target=x86_64-pc-freebsd12-elf', '-nostdlibinc', '-D__PS4__', '-D__ORBIS__', '-D__OPENORBIS__', '-fPIC',
+             '-funwind-tables', '-isysroot', str(PS4_SDK), '-isystem', str(Path(__file__).resolve().parents[1] / 'ps4/compat'),
+             '-isystem', str(PS4_SDK / 'include'), '-march=btver2']
 TARGETS = {t.key: t for t in (
     Target('win-x64', 'x86_64-pc-windows-msvc', 'build/host64-exe', 'dhd64.exe', 'win64'),
     Target('linux-x64', 'x86_64-unknown-linux-gnu', 'build/host64-linux', 'dhd64', 'sysv64',
@@ -110,6 +116,9 @@ TARGETS = {t.key: t for t in (
            jobs=max(2, (os.cpu_count() or 4) // 2), outputs=8,
            flags=['--target=aarch64-linux-android%d' % ANDROID_API, '-march=armv8-a', '-moutline-atomics', '-mtune=cortex-a78',
                   '-fPIC', '-fomit-frame-pointer']),
+    # PS4: built on Linux/WSL into an ELF that port/ps4/make_pkg.sh turns into eboot.bin and a .pkg
+    Target('ps4', None, 'build/host64-ps4', 'dhd_ps4.elf', 'sysv64', jobs=os.cpu_count() or 8, outputs=8,
+           flags=PS4_FLAGS),
 )}
 # Off Windows: the POSIX host instead of the Win32 one
 POSIX_UNITS = {'port/host/host_win32.c': 'port/host/host_posix.c'}
@@ -125,14 +134,22 @@ ANDROID_UNITS = ['port/host/android_main.c', 'port/host/android_perf.c', 'port/h
 ANDROID_EXPORTS = '{\n  global: SDL_main; Java_app_downhillrevived_Native_*; Java_app_downhillrevived_DiscImage_*;\n  local: *;\n};\n'
 
 
+# PS4: the CPU device behind gpu_exact.inc instead of the Rust renderer, and the console's host
+PS4_UNITS = {'port/gs/gpu_rust.c': 'port/ps4/gpu_cpu.c'}
+PS4_EXTRA = ['port/ps4/ps4_host.c', 'port/ps4/sdl3_ps4.c', 'port/ps4/rust_ps4.c']
+
+
 def host_units(t):
     if t.windows:
         return list(HOST_UNITS)
+    if t.ps4:
+        units = [PS4_UNITS.get(POSIX_UNITS.get(u, u), POSIX_UNITS.get(u, u)) for u in HOST_UNITS if u not in WINDOWS_ONLY]
+        return units + PS4_EXTRA
     return [POSIX_UNITS.get(u, u) for u in HOST_UNITS if u not in WINDOWS_ONLY] + (ANDROID_UNITS if t.android else PHONE_UNITS if t.ios else [])
 
 
 def glue(t):
-    return [SOURCE / n for n in ('guest_memory.c', 'guest_memory_%s.c' % ('win32' if t.windows else 'posix'),
+    return [SOURCE / n for n in ('guest_memory.c', 'guest_memory_%s.c' % ('win32' if t.windows else 'ps4' if t.ps4 else 'posix'),
                                  'fiber.c', 'fiber_%s.c' % t.fiber, 'fp_mode.c', 'guest_place.c', 'bridge.c',
                                  'diagnostics.c', 'launcher.c')]
 
@@ -179,6 +196,8 @@ def fiber_test(t, a, cc, wabt, out, env):
 def rust_library(t, work):
     """The Rust library's report (rustgs.build): here, or for linux-x64 in WSL without cargo, from
     rustgs.py on the Windows side (WSL's interop, python.exe)."""
+    if t.ps4:
+        return {'lib': None, 'native_static_libs': []}  # no Rust on the PS4: port/ps4/gpu_cpu.c renders
     import rustgs  # cargo through rustgs only (its flags, version gate, checks and cache)
     if t.key != 'linux-x64' or shutil.which('cargo') or not shutil.which('python.exe'):
         try:
@@ -231,6 +250,13 @@ def pgo_keys(profile, tools):
 
 def sdl(t, a):
     """(SDL3's library, its include directory, the libraries it needs at link time)."""
+    if t.ps4:
+        # SDL3's own headers (the same release as sdl3.py's) and port/ps4/sdl3_ps4.c, the subset of
+        # SDL3 the host uses, over the console's libraries
+        include = Path(os.environ.get('SDL3_INCLUDE') or DEVCACHES / 'SDL3-3.4.18/include')
+        if not (include / 'SDL3/SDL.h').exists():
+            raise ValueError('PS4: SDL3 headers not found (set SDL3_INCLUDE to SDL3-3.4.18/include)')
+        return None, include.resolve(), []
     import sdl3
     if t.android:
         lib, include, _java = sdl3.android_build()
@@ -356,6 +382,8 @@ def main():
             p.error('no %s SDK (xcrun): %s' % (sdk_name, sdk.stderr.strip()))
         t.flags = ['-isysroot', sdk.stdout.strip()] + t.flags
         ndk, tools, cc, ar = None, None, '/usr/bin/clang', '/usr/bin/ar'
+    elif t.ps4:
+        ndk, tools, cc, ar = None, None, 'clang', 'llvm-ar'  # LLVM's (on PATH), with OpenOrbis's sysroot
     elif t.posix:
         ndk, tools, cc, ar = None, None, 'clang', 'ar'
     if a.fiber_test:
@@ -457,7 +485,8 @@ def main():
         # installs lack: there the module's memory is at most 2 GiB, the guest reserved in two parts with
         # a 64 KiB window above (guest_memory.c, finding 258), and
         # wasm2c's own guard-page checks are off (prepare_wasm2c.py's MEMCHECK_SKIP; finding 224)
-        memcheck = (['-DWASM_RT_MEMCHECK_BOUNDS_CHECK=1', '-DWASM_RT_SKIP_BOUNDS_CHECKS=1'] if t.ios
+        # The PS4 takes the iOS layout too: no 8 GiB reservation for a homebrew app (port/ps4/PLAN.md)
+        memcheck = (['-DWASM_RT_MEMCHECK_BOUNDS_CHECK=1', '-DWASM_RT_SKIP_BOUNDS_CHECKS=1'] if t.ios or t.ps4
                     else ['-DWASM_RT_MEMCHECK_GUARD_PAGES=1'])
         defines = ['-DWASM_RT_STACK_DEPTH_COUNT=1', '-DWASM_RT_MAX_CALL_STACK_DEPTH=512', '-DWASM_RT_THREAD_LOCAL=',
                    *memcheck, '-DWASM_RT_SKIP_SIGNAL_RECOVERY=1']
@@ -608,6 +637,17 @@ def main():
             exe = lib_dir/t.exe
             run([tools/'llvm-strip.exe', '--strip-unneeded', '-o', exe, debug])
             run([tools/'llvm-strip.exe', '--strip-unneeded', '-o', lib_dir/'libSDL3.so', sdl_lib])
+        elif t.ps4:
+            # Sony's linker script, PIE and OpenOrbis's crt1, as the toolchain's own samples; the
+            # console's libraries are stubs that the loader resolves (port/ps4/make_pkg.sh then makes
+            # eboot.bin and the package)
+            sdk = PS4_SDK
+            rsp = work/'link.rsp'
+            rsp.write_text('\n'.join('"%s"' % x for x in objects + [library]))
+            run(['ld.lld', '-m', 'elf_x86_64', '-pie', '--eh-frame-hdr', '--gc-sections', '--error-limit=0',
+                 '--script', sdk/'link.x', sdk/'lib/crt1.o', '-L'+str(sdk/'lib'), '@'+str(rsp),
+                 '-lSceVideoOut', '-lSceAudioOut', '-lScePad', '-lSceUserService', '-lSceSystemService',
+                 '-lSceSysmodule', '-lSceNet', '-lSceLibcInternal', '-lc', '-lkernel', '-o', exe], timeout=900)
         elif t.mac:
             # ld64: -dead_strip as --gc-sections; no -rdynamic (exporting every symbol keeps the
             # module-side code of fps.c alive, which names guest data the host does not have); -S: no

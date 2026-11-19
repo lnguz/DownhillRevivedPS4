@@ -110,6 +110,8 @@ void host_thread_name(const char *name)
     if (!strcmp(name, "game") || !strcmp(name, "vu") || !strcmp(name, "gs") || !strcmp(name, "native"))
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+#elif defined(__ORBIS__)
+    pthread_setname_np(pthread_self(), name);  /* PS4: names only show in the console's debug tools */
 #else
     /* Linux and Android: the main thread's name is the process's own (ps, top, pgrep, a desktop's
        system monitor), so that thread keeps "dhd" (a crash report then says thread dhd) */

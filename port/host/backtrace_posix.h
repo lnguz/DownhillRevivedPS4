@@ -44,6 +44,14 @@ static inline void backtrace_symbols_fd(void *const *frames, int count, int fd)
         }
     }
 }
+#elif defined(__ORBIS__)
+/* PS4: no <execinfo.h> and no unwinder interface in the console's libc; a crash report there has
+   no frames (the system's own crash handling records the process's state). */
+static inline int backtrace(void **frames, int max) { (void)frames; (void)max; return 0; }
+static inline void backtrace_symbols_fd(void *const *frames, int count, int fd)
+{
+    (void)frames; (void)count; (void)fd;
+}
 #else
 #include <execinfo.h>
 #endif
