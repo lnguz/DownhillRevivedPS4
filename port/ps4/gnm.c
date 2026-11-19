@@ -202,7 +202,7 @@ int gnm_finish(void)
     uint64_t fence = (uint64_t)(uintptr_t)gnm.fence;
     uint32_t value = ++gnm.fence_value;
     emit(PKT3(IT_EVENT_WRITE_EOP, 5, 0));
-    emit(0x28u | (5u << 8));  /* BOTTOM_OF_PIPE_TS */
+    emit(0x14u | (5u << 8));  /* CACHE_FLUSH_AND_INV_TS_EVENT: colour and depth caches too */
     emit((uint32_t)fence);
     emit(((uint32_t)(fence >> 32) & 0xFFFFu) | (1u << 29));  /* DATA_SEL: the low 32 bits */
     emit(value);
@@ -296,6 +296,135 @@ static int check(void)
     return finished && !wrong;
 }
 
+/* ---- the graphics pipeline's check (port/ps4/kernels/graphics/triangle.ll) ----
+
+   One red triangle into a 256x256 RGBA8 render target, counted by the CPU: the vertex and pixel
+   stages, the colour buffer and the draw, as the native renderer will need them. Context state
+   from the driver's default (sceGnmDrawInitDefaultHardwareState350), then the registers below
+   (offsets from Mesa's GCN 1.1 register database). Only with /data/dhd/gpu_triangle: a wrong
+   graphics state can hang the GPU. */
+uint32_t sceGnmDrawInitDefaultHardwareState350(uint32_t *commands, uint32_t dwords);
+
+enum { IT_SET_CONTEXT_REG = 0x69, IT_SET_UCONFIG_REG = 0x79, IT_DRAW_INDEX_AUTO = 0x2D };
+
+static void set_context(uint32_t reg, uint32_t value)
+{
+    emit(PKT3(IT_SET_CONTEXT_REG, 2, 0));
+    emit(reg);
+    emit(value);
+}
+
+static void set_graphics_sh(uint32_t reg, uint32_t a, uint32_t b)
+{
+    emit(PKT3(IT_SET_SH_REG, 3, 0));
+    emit(reg);
+    emit(a);
+    emit(b);
+}
+
+static int find_shader(const char *name, uint32_t *offset, uint32_t *rsrc1, uint32_t *rsrc2, uint32_t *ena, uint32_t *addr)
+{
+    for (size_t i = 0; i < sizeof gcn_shaders / sizeof gcn_shaders[0]; i++)
+        if (!strcmp(gcn_shaders[i].name, name)) {
+            *offset = gcn_shaders[i].offset; *rsrc1 = gcn_shaders[i].rsrc1; *rsrc2 = gcn_shaders[i].rsrc2;
+            *ena = gcn_shaders[i].ps_input_ena; *addr = gcn_shaders[i].ps_input_addr;
+            return 1;
+        }
+    return 0;
+}
+
+static void triangle_check(void)
+{
+    struct stat st;
+    if (stat("/data/dhd/gpu_triangle", &st) != 0) return;
+    uint32_t vs, vs1, vs2, ps, ps1, ps2, ena, addr, unused;
+    if (!find_shader("triangle_vs", &vs, &vs1, &vs2, &unused, &unused) ||
+        !find_shader("triangle_ps", &ps, &ps1, &ps2, &ena, &addr)) {
+        fprintf(stderr, "gnm: triangle: no shaders\n");
+        return;
+    }
+    uint8_t *code = gnm_alloc(sizeof gcn_graphics, 4096);
+    uint32_t *target = gnm_alloc(256 * 256 * 4, 65536);
+    if (!code || !target) return;
+    memcpy(code, gcn_graphics, sizeof gcn_graphics);
+    memset(target, 0, 256 * 256 * 4);
+    uint64_t vs_at = (uint64_t)(uintptr_t)(code + vs), ps_at = (uint64_t)(uintptr_t)(code + ps);
+    uint64_t rt = (uint64_t)(uintptr_t)target;
+    fprintf(stderr, "gnm: triangle: vs at %p (rsrc1 0x%x), ps at %p (rsrc1 0x%x, inputs 0x%x/0x%x), target %p\n",
+            (void *)(uintptr_t)vs_at, vs1, (void *)(uintptr_t)ps_at, ps1, ena, addr, (void *)target);
+    gnm_begin();
+    gnm.count += sceGnmDrawInitDefaultHardwareState350(gnm.commands + gnm.count, 256);
+    /* the colour buffer: RGBA8 UNORM, linear (tile mode index 8, the display's LinearAligned) */
+    set_context(0x318, (uint32_t)(rt >> 8));     /* CB_COLOR0_BASE */
+    set_context(0x319, 256 / 8 - 1);             /* CB_COLOR0_PITCH.TILE_MAX */
+    set_context(0x31A, 256 * 256 / 64 - 1);      /* CB_COLOR0_SLICE.TILE_MAX */
+    set_context(0x31B, 0);                       /* CB_COLOR0_VIEW */
+    set_context(0x31C, 10u << 2);                /* CB_COLOR0_INFO: FORMAT COLOR_8_8_8_8, UNORM, SWAP_STD */
+    set_context(0x31D, 8);                       /* CB_COLOR0_ATTRIB.TILE_MODE_INDEX */
+    set_context(0x202, 0x00CC0010u);             /* CB_COLOR_CONTROL: CB_NORMAL, ROP3 copy */
+    set_context(0x1E0, 0);                       /* CB_BLEND0_CONTROL: no blending */
+    set_context(0x08E, 0xF);                     /* CB_TARGET_MASK */
+    set_context(0x08F, 0xF);                     /* CB_SHADER_MASK */
+    /* no depth or stencil */
+    set_context(0x010, 0);                       /* DB_Z_INFO: FORMAT INVALID */
+    set_context(0x011, 0);                       /* DB_STENCIL_INFO */
+    set_context(0x200, 0);                       /* DB_DEPTH_CONTROL */
+    set_context(0x000, 0);                       /* DB_RENDER_CONTROL */
+    set_context(0x203, 1u << 4);                 /* DB_SHADER_CONTROL: EARLY_Z_THEN_LATE_Z */
+    /* the screen: 256x256, screen-space positions (no viewport transform), no clipping or culling */
+    set_context(0x00C, 0);                       /* PA_SC_SCREEN_SCISSOR_TL */
+    set_context(0x00D, 256u | 256u << 16);       /* PA_SC_SCREEN_SCISSOR_BR */
+    set_context(0x080, 0);                       /* PA_SC_WINDOW_OFFSET */
+    set_context(0x081, 0x80000000u);             /* PA_SC_WINDOW_SCISSOR_TL: WINDOW_OFFSET_DISABLE */
+    set_context(0x082, 256u | 256u << 16);       /* PA_SC_WINDOW_SCISSOR_BR */
+    set_context(0x090, 0x80000000u);             /* PA_SC_GENERIC_SCISSOR_TL */
+    set_context(0x091, 256u | 256u << 16);       /* PA_SC_GENERIC_SCISSOR_BR */
+    set_context(0x094, 0x80000000u);             /* PA_SC_VPORT_SCISSOR_0_TL */
+    set_context(0x095, 256u | 256u << 16);       /* PA_SC_VPORT_SCISSOR_0_BR */
+    set_context(0x0B4, 0x00000000u);             /* PA_SC_VPORT_ZMIN_0: 0.0 */
+    set_context(0x0B5, 0x3F800000u);             /* PA_SC_VPORT_ZMAX_0: 1.0 */
+    set_context(0x206, (1u << 8) | (1u << 9) | (1u << 10));  /* PA_CL_VTE_CNTL: XY, Z, W0 as given */
+    set_context(0x204, (1u << 16) | (1u << 19)); /* PA_CL_CLIP_CNTL: CLIP_DISABLE, DX_CLIP_SPACE_DEF */
+    set_context(0x205, 0);                       /* PA_SU_SC_MODE_CNTL: no culling */
+    set_context(0x207, 0);                       /* PA_CL_VS_OUT_CNTL */
+    set_context(0x292, 0);                       /* PA_SC_MODE_CNTL_0 */
+    set_context(0x2F8, 0);                       /* PA_SC_AA_CONFIG: one sample */
+    /* the stages' interface: one parameter, four-component position, a 32-bit colour export */
+    set_context(0x1B1, 0);                       /* SPI_VS_OUT_CONFIG: one parameter */
+    set_context(0x1C3, 4);                       /* SPI_SHADER_POS_FORMAT: POS0 4COMP */
+    set_context(0x191, 0);                       /* SPI_PS_INPUT_CNTL_0 */
+    set_context(0x1B3, ena);                     /* SPI_PS_INPUT_ENA */
+    set_context(0x1B4, addr);                    /* SPI_PS_INPUT_ADDR */
+    set_context(0x1B6, 1);                       /* SPI_PS_IN_CONTROL: NUM_INTERP 1 */
+    set_context(0x1B8, 0);                       /* SPI_BARYC_CNTL */
+    set_context(0x1C4, 0);                       /* SPI_SHADER_Z_FORMAT */
+    set_context(0x1C5, 9);                       /* SPI_SHADER_COL_FORMAT: COL0 32_ABGR */
+    set_context(0x2D5, 0);                       /* VGT_SHADER_STAGES_EN: VS and PS only */
+    set_context(0x290, 0);                       /* VGT_GS_MODE */
+    set_graphics_sh(0x48, (uint32_t)(vs_at >> 8), (uint32_t)(vs_at >> 40));  /* SPI_SHADER_PGM_LO/HI_VS */
+    set_graphics_sh(0x4A, vs1, vs2);                                          /* SPI_SHADER_PGM_RSRC1/2_VS */
+    set_graphics_sh(0x08, (uint32_t)(ps_at >> 8), (uint32_t)(ps_at >> 40));  /* SPI_SHADER_PGM_LO/HI_PS */
+    set_graphics_sh(0x0A, ps1, ps2);                                          /* SPI_SHADER_PGM_RSRC1/2_PS */
+    emit(PKT3(IT_SET_UCONFIG_REG, 2, 0));
+    emit(0x242);                                 /* VGT_PRIMITIVE_TYPE */
+    emit(4);                                     /* DI_PT_TRILIST */
+    emit(PKT3(IT_DRAW_INDEX_AUTO, 2, 0));
+    emit(3);                                     /* three vertices */
+    emit(2);                                     /* DRAW_INITIATOR: SOURCE_SELECT auto index */
+    emit(PKT3(IT_EVENT_WRITE, 1, 0));
+    emit(0x16u);                                 /* CACHE_FLUSH_AND_INV_EVENT: the colour buffer to memory */
+    uint64_t start = sceKernelGetProcessTime();
+    int ok = gnm_finish();
+    unsigned red = 0, other = 0;
+    for (unsigned i = 0; i < 256 * 256; i++) {
+        if (target[i] == 0xFF0000FFu) red++;
+        else if (target[i]) other++;
+    }
+    fprintf(stderr, "gnm: triangle check %s: %u red pixels (16200 expected), %u others, pixel (30,30) 0x%08x, %llu us\n",
+            ok && red > 15000 && red < 17500 ? "passed" : "FAILED", red, other, target[30 * 256 + 30],
+            (unsigned long long)(sceKernelGetProcessTime() - start));
+}
+
 int gnm_init(void)
 {
     if (gnm.ready || gnm.failed) return gnm.ready;
@@ -336,5 +465,6 @@ int gnm_init(void)
     gnm.failed = 0;
     if (!check()) { gnm.failed = 1; return 0; }
     gnm.ready = 1;
+    triangle_check();
     return 1;
 }

@@ -45,6 +45,53 @@ def elf_image(data):
     return bytes(image), symbols
 
 
+def graphics(tmp, llc):
+    """The graphics shaders: (code, [(name, offset, {register: value})]) from kernels/graphics/*.ll,
+    each file's .text placed at a 256-byte boundary after the last; the registers are LLVM's
+    .AMDGPU.config pairs (SPI_SHADER_PGM_RSRC1/2_*, SPI_PS_INPUT_ENA/ADDR, ...), one block per
+    function in the order of the functions."""
+    code = bytearray()
+    shaders = []
+    for source in sorted((KERNELS / 'graphics').glob('*.ll')):
+        obj = Path(tmp) / (source.stem + '.gfx.o')
+        subprocess.run([llc, '-mtriple=amdgcn-mesa-mesa3d', '-mcpu=gfx701', '-O3', '-filetype=obj',
+                        str(source), '-o', str(obj)], check=True)
+        data = obj.read_bytes()
+        (shoff,) = struct.unpack_from('<Q', data, 0x28)
+        (shentsize, shnum, shstrndx) = struct.unpack_from('<HHH', data, 0x3A)
+        sections = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * shentsize) for i in range(shnum)]
+        names = sections[shstrndx]
+
+        def name(s):
+            at = names[4] + s[0]
+            return data[at:data.index(b'\0', at)].decode()
+        by = {name(s): s for s in sections}
+        text = data[by['.text'][4]:by['.text'][4] + by['.text'][5]]
+        config = data[by['.AMDGPU.config'][4]:by['.AMDGPU.config'][4] + by['.AMDGPU.config'][5]]
+        symtab = by['.symtab']
+        strtab = sections[symtab[6]]
+        functions = []
+        for at in range(symtab[4], symtab[4] + symtab[5], 24):
+            nm, info, _other, _shndx, value, _size = struct.unpack_from('<IBBHQQ', data, at)
+            if info & 15 == 2:  # STT_FUNC
+                functions.append((value, data[strtab[4] + nm:data.index(b'\0', strtab[4] + nm)].decode()))
+        functions.sort()
+        blocks, block = [], None
+        for at in range(0, len(config), 8):
+            reg, value = struct.unpack_from('<II', config, at)
+            if reg in (0xB028, 0xB128, 0xB228, 0xB328, 0xB428, 0xB528, 0xB848):  # a stage's RSRC1: a new function
+                block = {}
+                blocks.append(block)
+            if block is not None:
+                block[reg] = value
+        base = (len(code) + 255) & ~255
+        code.extend(b'\0' * (base - len(code)))
+        code.extend(text)
+        for (offset, fn), regs in zip(functions, blocks):
+            shaders.append((fn, base + offset, regs))
+    return bytes(code), shaders
+
+
 def build(output, clang='clang', lld='ld.lld'):
     sources = sorted(KERNELS.glob('*.cl'))
     with tempfile.TemporaryDirectory() as tmp:
@@ -59,6 +106,8 @@ def build(output, clang='clang', lld='ld.lld'):
                             '-Xclang', '-target-feature', '-Xclang', '-flat-for-global', '-c', str(source), '-o', str(obj)],
                            check=True)
             objects.append(str(obj))
+        llc = str(Path(clang).with_name('llc')) if '/' in clang else 'llc'
+        gfx_code, gfx_shaders = graphics(tmp, llc)
         so = Path(tmp) / 'kernels.so'
         subprocess.run([lld, '-shared', *objects, '-o', str(so)], check=True)
         image, symbols = elf_image(so.read_bytes())
@@ -81,6 +130,17 @@ def build(output, clang='clang', lld='ld.lld'):
     lines.append('static const struct { const char *name; uint32_t descriptor; } gcn_kernels[] = {')
     for name in kernels:
         lines.append('    {"%s", 0x%x},' % (name, symbols[name + '.kd']))
+    lines.append('};')
+    lines.append('static const uint8_t gcn_graphics[%d] __attribute__((aligned(256))) = {' % max(len(gfx_code), 1))
+    for at in range(0, max(len(gfx_code), 1), 24):
+        lines.append('    ' + ', '.join('%d' % b for b in (gfx_code or b'\0')[at:at + 24]) + ',')
+    lines.append('};')
+    lines.append('/* a graphics shader: its code offset in gcn_graphics, RSRC1/RSRC2, SPI_PS_INPUT_ENA/ADDR */')
+    lines.append('static const struct { const char *name; uint32_t offset, rsrc1, rsrc2, ps_input_ena, ps_input_addr; } gcn_shaders[] = {')
+    for fn, offset, regs in gfx_shaders:
+        rsrc1 = regs.get(0xB028, regs.get(0xB128, 0))
+        rsrc2 = regs.get(0xB02C, regs.get(0xB12C, 0))
+        lines.append('    {"%s", 0x%x, 0x%x, 0x%x, 0x%x, 0x%x},' % (fn, offset, rsrc1, rsrc2, regs.get(0x286CC, 0), regs.get(0x286D0, 0)))
     lines.append('};')
     text = '\n'.join(lines) + '\n'
     Path(output).parent.mkdir(parents=True, exist_ok=True)
