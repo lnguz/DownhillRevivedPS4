@@ -136,7 +136,7 @@ ANDROID_EXPORTS = '{\n  global: SDL_main; Java_app_downhillrevived_Native_*; Jav
 
 # PS4: the CPU device behind gpu_exact.inc instead of the Rust renderer, and the console's host
 PS4_UNITS = {'port/gs/gpu_rust.c': 'port/ps4/gpu_cpu.c'}
-PS4_EXTRA = ['port/ps4/ps4_host.c', 'port/ps4/sdl3_ps4.c', 'port/ps4/rust_ps4.c']
+PS4_EXTRA = ['port/ps4/ps4_host.c', 'port/ps4/sdl3_ps4.c', 'port/ps4/rust_ps4.c', 'port/ps4/gnm.c']
 
 
 def host_units(t):
@@ -536,6 +536,14 @@ def main():
                       *prefix_maps] + (['-gline-tables-only'] if a.debug else [])
         objdir = work/'obj'
         suffix = '.obj' if t.windows else '.o'
+        gcn = []
+        if t.ps4:
+            # the GPU kernels (port/ps4/kernels) as gcn_kernels.h; its hash in a define, so the
+            # object cache rebuilds gnm.c when a kernel changes
+            sys.path.insert(0, str(ROOT/'port/ps4/tools'))
+            import gcn_kernels
+            digest = gcn_kernels.build(work/'gcn'/'gcn_kernels.h', cc, 'ld.lld')
+            gcn = ['-I'+str(work/'gcn'), '-DGCN_KERNELS_HASH=0x'+digest]
 
         def compile_one(source, timeout=1800):
             source = Path(source)
@@ -549,6 +557,8 @@ def main():
                 extra += ['-Dmain=dhd_launcher_main']  # SDL_main (android_main.c) calls it
             if rel.endswith('host64/launcher.c') and t.ios:
                 extra += ['-Dmain=dhd_main']  # the app's game thread calls it (port/ios/host/ios_main.m)
+            if rel.startswith('port/ps4/gnm'):
+                extra += gcn
             if 'libmpeg2/' in rel:
                 extra += ['-I'+str(ROOT/'port/third_party/libmpeg2')]
             obj = objdir/(rel.replace('/', '_') + suffix)
@@ -644,10 +654,16 @@ def main():
             sdk = PS4_SDK
             rsp = work/'link.rsp'
             rsp.write_text('\n'.join('"%s"' % x for x in objects + [library]))
+            libs = ['-lSceVideoOut', '-lSceAudioOut', '-lScePad', '-lSceUserService', '-lSceSystemService',
+                    '-lSceSysmodule', '-lSceGnmDriver', '-lc', '-lkernel']
+            script = Path(__file__).resolve().parents[1]/'ps4/link.x'
             run(['ld.lld', '-m', 'elf_x86_64', '-pie', '--eh-frame-hdr', '--gc-sections', '--error-limit=0',
-                 '--script', Path(__file__).resolve().parents[1]/'ps4/link.x', sdk/'lib/crt1.o', '-L'+str(sdk/'lib'), '@'+str(rsp),
-                 '-lSceVideoOut', '-lSceAudioOut', '-lScePad', '-lSceUserService', '-lSceSystemService',
-                 '-lSceSysmodule', '-lc', '-lkernel', '-o', exe], timeout=900)
+                 '--script', script, sdk/'lib/crt1.o', '-L'+str(sdk/'lib'), '@'+str(rsp), *libs, '-o', exe], timeout=900)
+            # The same game as a module (dhd.prx): the package's eboot loads /data/dhd/dhd.prx when it
+            # is there (port/ps4/ps4_host.c), so a test build reaches the console over FTP alone
+            run(['ld.lld', '-m', 'elf_x86_64', '-pie', '--eh-frame-hdr', '--gc-sections', '--error-limit=0',
+                 '--export-dynamic-symbol=dhd_prx_main', '--script', script, sdk/'lib/crtlib.o',
+                 '-L'+str(sdk/'lib'), '@'+str(rsp), *libs, '-o', exe.with_name('dhd_prx.elf')], timeout=900)
         elif t.mac:
             # ld64: -dead_strip as --gc-sections; no -rdynamic (exporting every symbol keeps the
             # module-side code of fps.c alive, which names guest data the host does not have); -S: no

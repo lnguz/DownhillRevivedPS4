@@ -96,6 +96,8 @@ int main(int argc,char **argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
 #endif
 #ifdef __ORBIS__
+    void ps4_prx_handoff(int, char **);  /* port/ps4/ps4_host.c: /data/dhd/dhd.prx, a test build */
+    ps4_prx_handoff(argc, argv);
     void ps4_constructors(void);  /* port/ps4/ps4_host.c: Sony's libc start runs no .init_array */
     ps4_constructors();
 #endif

@@ -68,6 +68,9 @@ extern void ios_text_input(int on);
 #define FIXED_SCREEN 0
 static SDL_MetalView metal_view;
 #endif
+#elif defined(__ORBIS__)
+#define WINDOW_FLAGS 0
+#define FIXED_SCREEN 1  /* PS4: the whole screen (port/ps4: sceVideoOut, no window system) */
 #else
 #define WINDOW_FLAGS 0
 #define FIXED_SCREEN 0
@@ -97,6 +100,10 @@ static void window_target(void *unused)
     if (!metal_view) metal_view = SDL_Metal_CreateView(sdl_window);
     target.kind = GS_WINDOW_METAL_LAYER;
     target.a = (uintptr_t)(metal_view ? SDL_Metal_GetLayer(metal_view) : NULL);
+#elif defined(__ORBIS__)
+    (void)props;
+    target.kind = 0;  /* PS4: the renderer shows its pictures with sceVideoOut (port/ps4/gpu_cpu.c) */
+    target.a = 1;
 #else  /* Linux and the BSDs: X11 or Wayland, whichever SDL's video driver is */
     if (!strcmp(SDL_GetCurrentVideoDriver(), "wayland")) {
         target.kind = GS_WINDOW_WAYLAND;
