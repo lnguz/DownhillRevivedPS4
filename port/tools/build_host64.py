@@ -645,9 +645,9 @@ def main():
             rsp = work/'link.rsp'
             rsp.write_text('\n'.join('"%s"' % x for x in objects + [library]))
             run(['ld.lld', '-m', 'elf_x86_64', '-pie', '--eh-frame-hdr', '--gc-sections', '--error-limit=0',
-                 '--script', sdk/'link.x', sdk/'lib/crt1.o', '-L'+str(sdk/'lib'), '@'+str(rsp),
+                 '--script', Path(__file__).resolve().parents[1]/'ps4/link.x', sdk/'lib/crt1.o', '-L'+str(sdk/'lib'), '@'+str(rsp),
                  '-lSceVideoOut', '-lSceAudioOut', '-lScePad', '-lSceUserService', '-lSceSystemService',
-                 '-lSceSysmodule', '-lSceNet', '-lSceLibcInternal', '-lc', '-lkernel', '-o', exe], timeout=900)
+                 '-lSceSysmodule', '-lc', '-lkernel', '-o', exe], timeout=900)
         elif t.mac:
             # ld64: -dead_strip as --gc-sections; no -rdynamic (exporting every symbol keeps the
             # module-side code of fps.c alive, which names guest data the host does not have); -S: no

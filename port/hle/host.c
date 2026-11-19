@@ -913,6 +913,10 @@ static void console_open(const char *path)
 static void console_open(const char *path)
 {
     setvbuf(stderr, NULL, _IONBF, 0);
+#ifdef __ORBIS__
+    (void)path;
+    return;  /* PS4: stderr already writes dhd.log (port/ps4/ps4_host.c); the console has no dup2 */
+#endif
     struct stat st;
     if (isatty(STDERR_FILENO) || (fstat(STDERR_FILENO, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISREG(st.st_mode))))
         return;

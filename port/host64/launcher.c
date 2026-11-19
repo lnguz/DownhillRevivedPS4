@@ -95,6 +95,10 @@ int main(int argc,char **argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
 #endif
+#ifdef __ORBIS__
+    void ps4_constructors(void);  /* port/ps4/ps4_host.c: Sony's libc start runs no .init_array */
+    ps4_constructors();
+#endif
     Args args={argc,argv};
 #ifdef HOST64_FAKE_MODULE
     return game(&args);  /* the boundary fixture: no window, no SDL */
