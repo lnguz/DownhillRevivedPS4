@@ -137,7 +137,7 @@ ANDROID_EXPORTS = '{\n  global: SDL_main; Java_app_downhillrevived_Native_*; Jav
 # PS4: the CPU device behind gpu_exact.inc instead of the Rust renderer, and the console's host
 PS4_UNITS = {}  # gpu_rust.c as everywhere, over port/ps4/render_ps4.c (dhd_render.h in C)
 PS4_EXTRA = ['port/ps4/ps4_host.c', 'port/ps4/sdl3_ps4.c', 'port/ps4/rust_ps4.c', 'port/ps4/gnm.c',
-             'port/ps4/render_ps4.c']
+             'port/ps4/render_ps4.c', 'port/ps4/ps4_profile.c']
 
 
 def host_units(t):
@@ -486,8 +486,8 @@ def main():
         # installs lack: there the module's memory is at most 2 GiB, the guest reserved in two parts with
         # a 64 KiB window above (guest_memory.c, finding 258), and
         # wasm2c's own guard-page checks are off (prepare_wasm2c.py's MEMCHECK_SKIP; finding 224)
-        # The PS4 takes the iOS layout too: no 8 GiB reservation for a homebrew app (port/ps4/PLAN.md)
-        memcheck = (['-DWASM_RT_MEMCHECK_BOUNDS_CHECK=1', '-DWASM_RT_SKIP_BOUNDS_CHECKS=1'] if t.ios or t.ps4
+        # The PS4 reserves the 8 GiB (sceKernelReserveVirtualRange: address space only; guest_memory_ps4.c)
+        memcheck = (['-DWASM_RT_MEMCHECK_BOUNDS_CHECK=1', '-DWASM_RT_SKIP_BOUNDS_CHECKS=1'] if t.ios
                     else ['-DWASM_RT_MEMCHECK_GUARD_PAGES=1'])
         defines = ['-DWASM_RT_STACK_DEPTH_COUNT=1', '-DWASM_RT_MAX_CALL_STACK_DEPTH=512', '-DWASM_RT_THREAD_LOCAL=',
                    *memcheck, '-DWASM_RT_SKIP_SIGNAL_RECOVERY=1']

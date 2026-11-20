@@ -112,6 +112,10 @@ void host_thread_name(const char *name)
 #endif
 #elif defined(__ORBIS__)
     pthread_setname_np(pthread_self(), name);  /* PS4: names only show in the console's debug tools */
+    {
+        void ps4_profile_thread(const char *name);  /* port/ps4/ps4_profile.c */
+        ps4_profile_thread(name);
+    }
 #else
     /* Linux and Android: the main thread's name is the process's own (ps, top, pgrep, a desktop's
        system monitor), so that thread keeps "dhd" (a crash report then says thread dhd) */

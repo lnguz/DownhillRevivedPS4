@@ -109,6 +109,7 @@ void perf_window(int front, double hz)
 }
 
 void perf_field(int ride) { SDL_SetAtomicInt(&riding, ride != 0); }
+int perf_riding(void) { return SDL_GetAtomicInt(&riding); }
 
 /* ---- the counters, once a segment (at most a second) ---- */
 

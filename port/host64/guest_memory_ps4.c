@@ -1,6 +1,7 @@
-/* PS4 mapping for guest_memory.c (port/ps4/PLAN.md), in the bounds-checked layout (HOST64_TWO_PARTS,
-   as iOS, finding 258): the guest's two parts are reserved with sceKernelReserveVirtualRange at the
-   places guest_memory.c picks from os_free_ranges (the process's gaps, read with
+/* PS4 mapping for guest_memory.c (port/ps4/PLAN.md). The default layout is the 8 GiB guard-page
+   reservation (os_reserve, sceKernelReserveVirtualRange: address space only); the bounds-checked
+   two-part layout (HOST64_TWO_PARTS, as iOS, finding 258) still builds: its parts are reserved at
+   the places guest_memory.c picks from os_free_ranges (the process's gaps, read with
    sceKernelVirtualQuery: the console has no /proc). The 32 MiB RAM is one block of direct memory
    mapped at each of its views (sceKernelMapDirectMemory accepts the same physical block at several
    addresses, so the views share their contents as memfd's MAP_SHARED mappings do elsewhere).
@@ -20,11 +21,12 @@
 #include "core_host.h"
 #include "guest_memory_os.h"
 
-#if !HOST64_TWO_PARTS
-#error "the PS4 builds the bounds-checked layout (build_host64.py's memcheck for ps4)"
-#endif
+/* The layout: the 8 GiB guard-page reservation (os_reserve), the default since the per-access
+   adapters of the two-part layout cost the EE's hot loops; the two-part one still builds
+   (HOST64_TWO_PARTS=1) for comparison. */
 
 #define RAM_SIZE 0x2000000ull
+#define GUEST_SIZE 0x200000000ull            /* the 8 GiB layout's reservation */
 #define DMEM_ALIGN 0x10000ull                /* 64 KiB: direct memory's allocation alignment */
 #define MAP_FIXED_ 0x10                       /* SCE_KERNEL_MAP_FIXED */
 #define MAP_NO_OVERWRITE_ 0x80                /* SCE_KERNEL_MAP_NO_OVERWRITE */
@@ -53,6 +55,7 @@ void os_fail(const char *what) {
     abort();
 }
 
+#if HOST64_TWO_PARTS
 static int add_range(GuestRange **r, unsigned *n, unsigned *cap, uint64_t lo, uint64_t hi) {
     if (lo < USER_LOW) lo = USER_LOW;
     if (hi > USER_TOP) hi = USER_TOP;
@@ -96,6 +99,8 @@ int os_reserve_at(uintptr_t at, uint64_t size) {
     return 1;
 }
 
+#endif
+
 int os_backing_open(void) {
     if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), RAM_SIZE, DMEM_ALIGN,
                                       ORBIS_KERNEL_WB_ONION, &ram_dmem) != 0) {
@@ -104,6 +109,20 @@ int os_backing_open(void) {
     }
     return 1;
 }
+
+#if !HOST64_TWO_PARTS
+uintptr_t os_reserve(void) {
+    if (!os_backing_open()) return 0;
+    /* 8 GiB of address space, inaccessible: commits and the RAM views map over it (MAP_FIXED) */
+    void *p = (void *)(uintptr_t)USER_LOW;
+    if (sceKernelReserveVirtualRange(&p, (size_t)GUEST_SIZE, 0, DMEM_ALIGN) != 0) {
+        os_backing_close();
+        return 0;
+    }
+    fprintf(stderr, "host64 memory: 8 GiB guest reservation at %p\n", p);
+    return (uintptr_t)p;
+}
+#endif
 
 int os_split(uintptr_t at, uint64_t size) {
     (void)at; (void)size; return 1;
@@ -118,7 +137,7 @@ int os_map_ram(uintptr_t at, uint64_t size, uint64_t file_offset) {
 }
 
 int os_private(uintptr_t at, uint64_t size) {
-    (void)at; (void)size; return 1;  /* already reserved by os_reserve_at */
+    (void)at; (void)size; return 1;  /* already reserved by os_reserve(_at) */
 }
 
 static int committed(uintptr_t at) {
