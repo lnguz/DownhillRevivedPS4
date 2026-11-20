@@ -206,19 +206,6 @@ void dhd_presence_set(int kind, const char *track, int place, int riders, const 
 }
 void dhd_presence_stop(void) {}
 
-int dhdr_png_size(const uint8_t *data, size_t size, uint32_t *w, uint32_t *h)
-{
-    (void)data; (void)size; *w = *h = 0;
-    return 0;
-}
-int dhdr_png_decode(const uint8_t *data, size_t size, uint8_t *rgba, uint32_t w, uint32_t h, uint32_t opaque)
-{
-    (void)data; (void)size; (void)rgba; (void)w; (void)h; (void)opaque;
-    return 0;
-}
-uint32_t dhdr_perf_read(uint64_t *out, uint32_t count) { (void)out; (void)count; return 0; }
-const char *dhdr_native_pipeline_crash(uint64_t *key) { (void)key; return NULL; }
-
 WsConn *ws_start(const char *url, const WsHandler *h) { (void)url; (void)h; return NULL; }
 void ws_send(WsConn *ws, int binary, const void *data, size_t n) { (void)ws; (void)binary; (void)data; (void)n; }
 void ws_stop(WsConn *ws) { (void)ws; }

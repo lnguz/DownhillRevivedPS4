@@ -135,8 +135,9 @@ ANDROID_EXPORTS = '{\n  global: SDL_main; Java_app_downhillrevived_Native_*; Jav
 
 
 # PS4: the CPU device behind gpu_exact.inc instead of the Rust renderer, and the console's host
-PS4_UNITS = {'port/gs/gpu_rust.c': 'port/ps4/gpu_cpu.c'}
-PS4_EXTRA = ['port/ps4/ps4_host.c', 'port/ps4/sdl3_ps4.c', 'port/ps4/rust_ps4.c', 'port/ps4/gnm.c']
+PS4_UNITS = {}  # gpu_rust.c as everywhere, over port/ps4/render_ps4.c (dhd_render.h in C)
+PS4_EXTRA = ['port/ps4/ps4_host.c', 'port/ps4/sdl3_ps4.c', 'port/ps4/rust_ps4.c', 'port/ps4/gnm.c',
+             'port/ps4/render_ps4.c']
 
 
 def host_units(t):
@@ -197,7 +198,7 @@ def rust_library(t, work):
     """The Rust library's report (rustgs.build): here, or for linux-x64 in WSL without cargo, from
     rustgs.py on the Windows side (WSL's interop, python.exe)."""
     if t.ps4:
-        return {'lib': None, 'native_static_libs': []}  # no Rust on the PS4: port/ps4/gpu_cpu.c renders
+        return {'lib': None, 'native_static_libs': []}  # no Rust on the PS4: port/ps4/render_ps4.c is dhd_render
     import rustgs  # cargo through rustgs only (its flags, version gate, checks and cache)
     if t.key != 'linux-x64' or shutil.which('cargo') or not shutil.which('python.exe'):
         try:

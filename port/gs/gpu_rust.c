@@ -144,6 +144,11 @@ __attribute__((constructor)) static void renderer_line(void)
 #ifdef _WIN64
 #define EXACT_OPTRACE 1
 #endif
+/* The PS4 (port/ps4/render_ps4.c): batches of up to 2048 primitives, a GPU dispatch and a barrier
+   each, so fewer and larger ones keep its GPU busier (the front end's default is 256). */
+#ifdef __ORBIS__
+#define EXACT_MAX_DRAWS 2048
+#endif
 #include "gpu_exact.inc"  /* the front end: Exact, the CPU half, and the op_* prototypes it calls */
 
 struct Native;
