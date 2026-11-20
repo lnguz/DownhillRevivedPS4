@@ -425,6 +425,148 @@ static void triangle_check(void)
             (unsigned long long)(sceKernelGetProcessTime() - start));
 }
 
+/* ---- the graphics pipeline's second check (kernels/graphics/scene.ll, scene.cl) ----
+
+   Three triangles into a 256x256 RGBA8 target with a 32-bit float depth buffer (1D-tiled, as the
+   DB requires a tiled surface): A textured (red and green squares) at z 0.5, B blue at z 0.7 behind
+   it (A must stay where they overlap), C white at half alpha in front at z 0.2, blended over A. The
+   CPU checks four pixels; the log also shows the depth buffer's first words, for its layout. Only
+   with /data/dhd/gpu_scene. */
+static void scene_check(void)
+{
+    struct stat st;
+    if (stat("/data/dhd/gpu_scene", &st) != 0) return;
+    uint32_t vs, vs1, vs2, ps, ps1, ps2, ena, addr, unused;
+    if (!find_shader("scene_vs", &vs, &vs1, &vs2, &unused, &unused) ||
+        !find_shader("scene_ps", &ps, &ps1, &ps2, &ena, &addr)) {
+        fprintf(stderr, "gnm: scene: no shaders\n");
+        return;
+    }
+    uint8_t *code = gnm_alloc(sizeof gcn_graphics, 4096);
+    uint32_t *target = gnm_alloc(256 * 256 * 4, 65536);
+    float *depth = gnm_alloc(256 * 256 * 4, 65536);
+    uint32_t *checker = gnm_alloc(64 * 64 * 4, 256), *blue = gnm_alloc(64 * 64 * 4, 256), *white = gnm_alloc(64 * 64 * 4, 256);
+    float *vertices = gnm_alloc(9 * 8 * 4, 256);
+    if (!code || !target || !depth || !checker || !blue || !white || !vertices) return;
+    memcpy(code, gcn_graphics, sizeof gcn_graphics);
+    memset(target, 0, 256 * 256 * 4);
+    for (unsigned i = 0; i < 256 * 256; i++) depth[i] = 1.0f;  /* the clear value: any tiling */
+    for (unsigned y = 0; y < 64; y++)
+        for (unsigned x = 0; x < 64; x++) {
+            checker[y * 64 + x] = ((x >> 3) + (y >> 3)) & 1 ? 0xFF00FF00u : 0xFF0000FFu;  /* green : red */
+            blue[y * 64 + x] = 0xFFFF0000u;
+            white[y * 64 + x] = 0xFFFFFFFFu;
+        }
+    /* x, y, z, 1, u, v, alpha, 1 */
+    static const float tris[3][3][8] = {
+        {{16, 16, 0.5f, 1, 0, 0, 1, 1}, {200, 16, 0.5f, 1, 1, 0, 1, 1}, {16, 200, 0.5f, 1, 0, 1, 1, 1}},
+        {{100, 100, 0.7f, 1, 0, 0, 1, 1}, {240, 100, 0.7f, 1, 1, 0, 1, 1}, {100, 240, 0.7f, 1, 0, 1, 1, 1}},
+        {{40, 40, 0.2f, 1, 0, 0, 0.5f, 1}, {120, 40, 0.2f, 1, 1, 0, 0.5f, 1}, {40, 120, 0.2f, 1, 0, 1, 0.5f, 1}},
+    };
+    memcpy(vertices, tris, sizeof tris);
+    uint64_t vs_at = (uint64_t)(uintptr_t)(code + vs), ps_at = (uint64_t)(uintptr_t)(code + ps);
+    uint64_t rt = (uint64_t)(uintptr_t)target, db = (uint64_t)(uintptr_t)depth;
+    gnm_begin();
+    gnm.count += sceGnmDrawInitDefaultHardwareState350(gnm.commands + gnm.count, 256);
+    set_context(0x318, (uint32_t)(rt >> 8));     /* CB_COLOR0_BASE */
+    set_context(0x319, 256 / 8 - 1);             /* CB_COLOR0_PITCH */
+    set_context(0x31A, 256 * 256 / 64 - 1);      /* CB_COLOR0_SLICE */
+    set_context(0x31B, 0);                       /* CB_COLOR0_VIEW */
+    set_context(0x31C, 10u << 2);                /* CB_COLOR0_INFO: COLOR_8_8_8_8 UNORM */
+    set_context(0x31D, 8);                       /* CB_COLOR0_ATTRIB: LinearAligned */
+    set_context(0x202, 0x00CC0010u);             /* CB_COLOR_CONTROL */
+    set_context(0x08E, 0xF);                     /* CB_TARGET_MASK */
+    set_context(0x08F, 0xF);                     /* CB_SHADER_MASK */
+    /* the depth buffer: Z_32_FLOAT, ARRAY_1D_TILED_THIN1, no stencil, no HTILE */
+    set_context(0x00F, (2u << 4) | (12u << 8));  /* DB_DEPTH_INFO: 1D thin, P8_32x32_16x16 */
+    set_context(0x010, 3u);                      /* DB_Z_INFO: Z_32_FLOAT */
+    set_context(0x011, 1u << 29);                /* DB_STENCIL_INFO: invalid, TILE_STENCIL_DISABLE */
+    set_context(0x012, (uint32_t)(db >> 8));     /* DB_Z_READ_BASE */
+    set_context(0x013, (uint32_t)(db >> 8));     /* DB_STENCIL_READ_BASE */
+    set_context(0x014, (uint32_t)(db >> 8));     /* DB_Z_WRITE_BASE */
+    set_context(0x015, (uint32_t)(db >> 8));     /* DB_STENCIL_WRITE_BASE */
+    set_context(0x016, (256u / 8 - 1) | ((256u / 8 - 1) << 11));  /* DB_DEPTH_SIZE */
+    set_context(0x017, 256 * 256 / 64 - 1);      /* DB_DEPTH_SLICE */
+    set_context(0x002, 0);                       /* DB_DEPTH_VIEW */
+    set_context(0x2AF, 0);                       /* DB_HTILE_SURFACE */
+    set_context(0x000, 0);                       /* DB_RENDER_CONTROL */
+    set_context(0x003, 0);                       /* DB_RENDER_OVERRIDE */
+    set_context(0x203, 1u << 4);                 /* DB_SHADER_CONTROL: EARLY_Z_THEN_LATE_Z */
+    set_context(0x00C, 0);                       /* PA_SC_SCREEN_SCISSOR_TL */
+    set_context(0x00D, 256u | 256u << 16);       /* PA_SC_SCREEN_SCISSOR_BR */
+    set_context(0x080, 0);                       /* PA_SC_WINDOW_OFFSET */
+    set_context(0x081, 0x80000000u);             /* PA_SC_WINDOW_SCISSOR_TL */
+    set_context(0x082, 256u | 256u << 16);       /* PA_SC_WINDOW_SCISSOR_BR */
+    set_context(0x090, 0x80000000u);             /* PA_SC_GENERIC_SCISSOR_TL */
+    set_context(0x091, 256u | 256u << 16);       /* PA_SC_GENERIC_SCISSOR_BR */
+    set_context(0x094, 0x80000000u);             /* PA_SC_VPORT_SCISSOR_0_TL */
+    set_context(0x095, 256u | 256u << 16);       /* PA_SC_VPORT_SCISSOR_0_BR */
+    set_context(0x0B4, 0x00000000u);             /* PA_SC_VPORT_ZMIN_0 */
+    set_context(0x0B5, 0x3F800000u);             /* PA_SC_VPORT_ZMAX_0 */
+    set_context(0x206, (1u << 8) | (1u << 9) | (1u << 10));  /* PA_CL_VTE_CNTL */
+    set_context(0x204, (1u << 16) | (1u << 19)); /* PA_CL_CLIP_CNTL */
+    set_context(0x205, 0);                       /* PA_SU_SC_MODE_CNTL */
+    set_context(0x207, 0);                       /* PA_CL_VS_OUT_CNTL */
+    set_context(0x292, 0);                       /* PA_SC_MODE_CNTL_0 */
+    set_context(0x2F8, 0);                       /* PA_SC_AA_CONFIG */
+    set_context(0x1B1, 0);                       /* SPI_VS_OUT_CONFIG: one parameter */
+    set_context(0x1C3, 4);                       /* SPI_SHADER_POS_FORMAT */
+    set_context(0x191, 0);                       /* SPI_PS_INPUT_CNTL_0 */
+    set_context(0x1B3, ena);                     /* SPI_PS_INPUT_ENA */
+    set_context(0x1B4, addr);                    /* SPI_PS_INPUT_ADDR */
+    set_context(0x1B6, 1);                       /* SPI_PS_IN_CONTROL: NUM_INTERP 1 */
+    set_context(0x1B8, 0);                       /* SPI_BARYC_CNTL */
+    set_context(0x1C4, 0);                       /* SPI_SHADER_Z_FORMAT */
+    set_context(0x1C5, 4);                       /* SPI_SHADER_COL_FORMAT: FP16_ABGR (blendable) */
+    set_context(0x2D5, 0);                       /* VGT_SHADER_STAGES_EN */
+    set_context(0x290, 0);                       /* VGT_GS_MODE */
+    set_graphics_sh(0x48, (uint32_t)(vs_at >> 8), (uint32_t)(vs_at >> 40));
+    /* LLVM's amdgpu_vs/amdgpu_ps (mesa3d) take their inreg arguments from s2 on: s0-s1 are reserved,
+       so the user data is four SGPRs, the address in the last two (the pixel stage's PRIM_MASK then
+       lands in s4, where it reads it). With two, the stage read its address from garbage. */
+    set_graphics_sh(0x4A, vs1, vs2 | (4u << 1));  /* RSRC2_VS.USER_SGPR: 4 */
+    set_graphics_sh(0x08, (uint32_t)(ps_at >> 8), (uint32_t)(ps_at >> 40));
+    set_graphics_sh(0x0A, ps1, ps2 | (4u << 1));  /* RSRC2_PS.USER_SGPR: 4 */
+    emit(PKT3(IT_SET_UCONFIG_REG, 2, 0));
+    emit(0x242);
+    emit(4);                                     /* VGT_PRIMITIVE_TYPE: DI_PT_TRILIST */
+    const uint32_t *textures[3] = {checker, blue, white};
+    for (unsigned t = 0; t < 3; t++) {
+        uint64_t vb = (uint64_t)(uintptr_t)(vertices + t * 24), tex = (uint64_t)(uintptr_t)textures[t];
+        /* A and B: test and write; C: test, no write, blended with its alpha */
+        set_context(0x200, t < 2 ? (1u << 1) | (1u << 2) | (1u << 4) : (1u << 1) | (1u << 4));  /* DB_DEPTH_CONTROL: LESS */
+        set_context(0x1E0, t < 2 ? 0u : 4u | (5u << 8) | (4u << 16) | (5u << 24) | (1u << 30));  /* CB_BLEND0: SRC_ALPHA, ONE_MINUS */
+        set_graphics_sh(0x4C, 0, 0);                                  /* SPI_SHADER_USER_DATA_VS_0/1: reserved */
+        set_graphics_sh(0x4E, (uint32_t)vb, (uint32_t)(vb >> 32));    /* SPI_SHADER_USER_DATA_VS_2/3 */
+        set_graphics_sh(0x0C, 0, 0);                                  /* SPI_SHADER_USER_DATA_PS_0/1: reserved */
+        set_graphics_sh(0x0E, (uint32_t)tex, (uint32_t)(tex >> 32));  /* SPI_SHADER_USER_DATA_PS_2/3 */
+        emit(PKT3(IT_DRAW_INDEX_AUTO, 2, 0));
+        emit(3);
+        emit(2);
+    }
+    emit(PKT3(IT_EVENT_WRITE, 1, 0));
+    emit(0x16u);                                 /* CACHE_FLUSH_AND_INV_EVENT */
+    uint64_t start = sceKernelGetProcessTime();
+    int ok = gnm_finish();
+    uint32_t p1 = target[30 * 256 + 30], p2 = target[105 * 256 + 105], p3 = target[130 * 256 + 130], p4 = target[50 * 256 + 50];
+    int good1 = p1 == 0xFF0000FFu, good2 = p2 == 0xFF0000FFu, good3 = p3 == 0xFFFF0000u;
+    unsigned r4 = p4 & 255, g4 = (p4 >> 8) & 255, b4 = (p4 >> 16) & 255;
+    int good4 = r4 >= 250 && g4 >= 120 && g4 <= 136 && b4 >= 120 && b4 <= 136;
+    fprintf(stderr, "gnm: scene check %s: texture 0x%08x %s, depth test 0x%08x %s, behind 0x%08x %s, blend 0x%08x %s (%llu us)\n",
+            ok && good1 && good2 && good3 && good4 ? "passed" : "FAILED", p1, good1 ? "ok" : "WRONG", p2, good2 ? "ok" : "WRONG",
+            p3, good3 ? "ok" : "WRONG", p4, good4 ? "ok" : "WRONG", (unsigned long long)(sceKernelGetProcessTime() - start));
+    unsigned written = 0;
+    for (unsigned i = 0; i < 256 * 256; i++) written += depth[i] != 1.0f;
+    fprintf(stderr, "gnm: scene depth: %u words written; words 0-15:", written);
+    for (unsigned i = 0; i < 16; i++) fprintf(stderr, " %.3f", depth[i]);
+    fprintf(stderr, "; row 2 (words 512-527):");
+    for (unsigned i = 512; i < 528; i++) fprintf(stderr, " %.3f", depth[i]);
+    fprintf(stderr, "\n");
+    unsigned colored = 0;
+    for (unsigned i = 0; i < 256 * 256; i++) colored += target[i] != 0;
+    fprintf(stderr, "gnm: scene: %u pixels drawn\n", colored);
+}
+
 int gnm_init(void)
 {
     if (gnm.ready || gnm.failed) return gnm.ready;
@@ -466,5 +608,6 @@ int gnm_init(void)
     if (!check()) { gnm.failed = 1; return 0; }
     gnm.ready = 1;
     triangle_check();
+    scene_check();
     return 1;
 }

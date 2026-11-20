@@ -9,6 +9,7 @@ words. No Sony shader compiler is involved: the GPU runs LLVM's code, dispatched
 Usage: gcn_kernels.py <output header> [clang] [ld.lld]. Prints the header's SHA-256 (the build
 puts it into a define, so the object cache sees a change of kernel)."""
 import hashlib
+import re
 import struct
 import subprocess
 import sys
@@ -54,8 +55,32 @@ def graphics(tmp, llc):
     shaders = []
     for source in sorted((KERNELS / 'graphics').glob('*.ll')):
         obj = Path(tmp) / (source.stem + '.gfx.o')
-        subprocess.run([llc, '-mtriple=amdgcn-mesa-mesa3d', '-mcpu=gfx701', '-O3', '-filetype=obj',
-                        str(source), '-o', str(obj)], check=True)
+        module = str(source)
+        body = source.with_suffix('.cl')
+        if body.exists():
+            # the stage's body in OpenCL C, linked into the entry points and inlined there
+            tool = lambda name: str(Path(llc).with_name(name)) if '/' in llc else name
+            bc = Path(tmp) / (source.stem + '.body.bc')
+            subprocess.run([tool('clang'), '-target', 'amdgcn-mesa-mesa3d', '-mcpu=gfx701', '-nogpulib', '-x', 'cl',
+                            # no -cl-fp32-correctly-rounded-divide-sqrt here: its attributes differ from the
+                            # entry points' and the body would not be inlined into them
+                            # nor flushed denormals (OpenCL's default): the entry points keep IEEE ones; and
+                            # the IEEE mode bit off, as graphics stages run (AMDGPU will not inline across it)
+                            '-cl-std=CL1.2', '-ffp-contract=off', '-fdenormal-fp-math=ieee', '-mno-amdgpu-ieee',
+                            '-fno-honor-nans', '-O2',
+                            '-I', str(KERNELS.parent), '-emit-llvm', '-c', str(body), '-o', str(bc)], check=True)
+            linked = Path(tmp) / (source.stem + '.linked.bc')
+            subprocess.run([tool('llvm-link'), str(source), str(bc), '-o', str(linked)], check=True)
+            optimized = Path(tmp) / (source.stem + '.opt.bc')
+            # only the entry points stay: the body is inlined into them and then dropped (a function
+            # left in the object would take one of the .AMDGPU.config blocks' places)
+            entries = re.findall(r'define\s+amdgpu_\w+\s+\S+\s+@(\w+)', source.read_text())
+            subprocess.run([tool('opt'), '-mtriple=amdgcn-mesa-mesa3d', '-mcpu=gfx701',
+                            '-internalize-public-api-list=' + ','.join(entries), '-passes=internalize,default<O3>,globaldce',
+                            str(linked), '-o', str(optimized)], check=True)
+            module = str(optimized)
+        subprocess.run([llc, '-mtriple=amdgcn-mesa-mesa3d', '-mcpu=gfx701', '-mattr=-flat-for-global', '-O3',
+                        '-filetype=obj', module, '-o', str(obj)], check=True)
         data = obj.read_bytes()
         (shoff,) = struct.unpack_from('<Q', data, 0x28)
         (shentsize, shnum, shstrndx) = struct.unpack_from('<HHH', data, 0x3A)
