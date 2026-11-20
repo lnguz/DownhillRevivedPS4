@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <orbis/SystemService.h>
 #include <orbis/VideoOut.h>
@@ -827,6 +828,13 @@ static void native_draw(DhdrNative *n, const DhdrCommand *k, const NatConstants 
     }
     gnm_context_reg(0x1E0, blend);                         /* CB_BLEND0_CONTROL */
     gnm_context_reg(0x08E, mask & 15);                     /* CB_TARGET_MASK */
+    /* a mesh's back faces culled (two-sided meshes keep both) */
+    /* FACE 0 (counter-clockwise on the screen is front), as the console showed: the other one culled
+       the ground. /data/dhd/mesh_face_cw (any file) takes the other, for a test. */
+    static int face = -1;
+    if (face < 0) { struct stat st; face = stat("/data/dhd/mesh_face_cw", &st) == 0 ? 1 : 0; }
+    uint32_t cull = (nat_in->c.flags & 4096u) && !(nat_in->c.flags & 8192u) ? (1u << 1) | ((uint32_t)face << 2) : 0;
+    gnm_context_reg(0x205, cull);                          /* PA_SU_SC_MODE_CNTL */
     gnm_context_reg(0x200, depth_control(depth));          /* DB_DEPTH_CONTROL */
     if (blend) {
         float fix = (float)k->blend_fix / 128.0f;
@@ -867,7 +875,14 @@ static void draw_state(DhdrNative *n)
     gnm_context_reg(0x202, 0x00CC0010u);                   /* CB_COLOR_CONTROL: normal, copy */
     gnm_context_reg(0x08F, 0xF);                           /* CB_SHADER_MASK */
     gnm_context_reg(0x206, 0x43Fu);                        /* PA_CL_VTE_CNTL: viewport scale and offset, W0 */
-    gnm_context_reg(0x204, 1u << 19);                      /* PA_CL_CLIP_CNTL: DX clip space, clipping on */
+    /* PA_CL_CLIP_CNTL: DX clip space, clipping on, and the clipper's new vertices get linear (screen
+       space) attributes, as the stages interpolate them: without it the textures of triangles cut
+       at the screen's edge swam as the camera moved */
+    gnm_context_reg(0x204, (1u << 19) | (1u << 24));
+    /* PA_CL_GB_VERT/HORZ_CLIP_ADJ: a guard band 8 times the viewport (the driver's default is the
+       viewport itself), so triangles reaching past the screen are cut by the scissor, not the clipper */
+    float band[4] = {8.0f, 1.0f, 8.0f, 1.0f};
+    gnm_context_regs(0x2FA, (const uint32_t *)band, 4);
     gnm_context_reg(0x205, 0);                             /* PA_SU_SC_MODE_CNTL: no culling */
     gnm_context_reg(0x207, 0);                             /* PA_CL_VS_OUT_CNTL */
     gnm_context_reg(0x292, 0);                             /* PA_SC_MODE_CNTL_0 */
@@ -884,6 +899,9 @@ static void draw_state(DhdrNative *n)
     gnm_uconfig_reg(0x242, 4);                             /* VGT_PRIMITIVE_TYPE: triangle list */
     n->target = n->depth = -2;
 }
+
+/* draws skipped for a conversion, textured draws with no texture, replacements drawn as decoded */
+static uint64_t native_skipped[3], native_drawn;
 
 static int native_render(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices, uint32_t index_count,
                          DhdrPictureResult *out)
@@ -940,8 +958,11 @@ static int native_render(DhdrNative *n, const DhdrPicture *p, const uint32_t *in
             nat.texture = (uint64_t)(uintptr_t)k->texture->gpu;
             nat.tex_w = k->texture->w; nat.tex_h = k->texture->h; nat.tex_pitch = k->texture->w; nat.tex_kind = 2;
         } else if (k->convert >= 0) {
+            native_skipped[0]++;
             continue;  /* conversions: not yet */
         }
+        if ((k->constants.flags & 1u) && !nat.tex_kind) native_skipped[1]++;  /* textured, nothing to read */
+        if (k->replacement) native_skipped[2]++;
         barrier_if(n, n->after_compute);
         uint32_t t = target->scale ? target->scale : 1;
         nat.c.scale = t | source_scale << 8 | (source_scale < t ? source_scale : t) << 16;
@@ -976,6 +997,7 @@ static int native_render(DhdrNative *n, const DhdrPicture *p, const uint32_t *in
             }
         }
         out->draws++;
+        native_drawn++;
         n->dirty |= 1ull << k->target;
         if (depth >= 0) n->dirty |= 1ull << depth;
     }
@@ -1004,6 +1026,16 @@ static int native_render(DhdrNative *n, const DhdrPicture *p, const uint32_t *in
     } else if (p->display_surface == -2 && n->display_w) {
         memset(n->display, 0, (size_t)n->display_w * n->display_h * 4);  /* the display is off: black */
         shown = 1;
+    }
+    static uint64_t since;
+    uint64_t now = sceKernelGetProcessTime();
+    if (!since) since = now;
+    else if (now - since >= 10000000) {
+        fprintf(stderr, "dhd_render native: last 10 s: %llu draws; skipped %llu that sample a conversion; %llu textured with no "
+                "texture; %llu replacements drawn as their decoded texture\n", (unsigned long long)native_drawn,
+                (unsigned long long)native_skipped[0], (unsigned long long)native_skipped[1], (unsigned long long)native_skipped[2]);
+        native_drawn = native_skipped[0] = native_skipped[1] = native_skipped[2] = 0;
+        since = now;
     }
     out->shown = (uint32_t)shown;
     out->display_width = n->display_w;
@@ -1052,7 +1084,7 @@ int dhdr_native_zread_take(DhdrNative *n, uint32_t *out, uint32_t cap, uint32_t 
     (void)n; (void)out; (void)cap; (void)rect_out; (void)tag_out;
     return 0;
 }
-int dhdr_native_meshes(void) { return 0; }
+int dhdr_native_meshes(void) { return 1; }  /* translated VU1 meshes: native.cl's mesh vertex stage */
 void dhdr_native_pipeline_list(const char *path) { (void)path; }
 const char *dhdr_native_pipeline_crash(uint64_t *key) { *key = 0; return NULL; }
 int dhdr_native_surface_read_begin(DhdrNative *n, uint32_t index, const uint32_t rect[4], uint32_t size[2])

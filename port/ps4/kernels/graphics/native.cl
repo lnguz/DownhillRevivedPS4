@@ -48,8 +48,45 @@ __attribute__((always_inline)) void native_vertex_body(uint32_t vertex, uint32_t
     uint32_t i = first + vertex;
     uint32_t v = indexed ? indices[i] : i;
     global const uint32_t *w = vertices + v * 8u;
-    float x = as_f(w[0]), y = as_f(w[1]), z = as_f(w[2]);
     uint32_t flags = nat->flags, scale = nat->scale;
+    if (flags & 4096u) {
+        /* native_mesh_vertex: a translated VU1 mesh's vertex (gs_mesh.h's GsMeshVertex: clip-space
+           position, u v and the Q factor, colour bytes). Placed as the GS places the kicked vertex
+           inside the loop's guard band, projected plainly outside it; homogeneous either way. */
+        float cx = as_f(w[0]), cy = as_f(w[1]), cz = as_f(w[2]), cw = as_f(w[3]);
+        float q = 1.0f / cw;
+        float sx = cx * q, sy = cy * q, sz = cz * q;
+        float fog = nat->mesh_fog[0] + nat->mesh_fog[1] * q;
+        fog = fog < nat->mesh_fog[2] ? fog : nat->mesh_fog[2];
+        fog = fog > 0.0f ? fog : 0.0f;
+        out[4] = as_f(w[4]) * q; out[5] = as_f(w[5]) * q; out[6] = as_f(w[6]) * q;
+        out[7] = __builtin_floorf(fog) / 255.0f;
+        float bound = __builtin_fabsf(nat->mesh_clip[3]);
+        int inside = (cw > 0.0f) & (__builtin_fabsf(sx + nat->mesh_clip[0]) <= bound) &
+                     (__builtin_fabsf(sy + nat->mesh_clip[1]) <= bound) & (cw + nat->mesh_clip[2] >= -bound);
+        if (inside) {
+            float gx = __builtin_truncf(sx * 16.0f), gy = __builtin_truncf(sy * 16.0f);
+            float px = (gx - nat->mesh_offset[0]) * 0.0625f + 0.5f, py = (gy - nat->mesh_offset[1]) * 0.0625f + 0.5f;
+            float pz = __builtin_truncf(sz);
+            pz = pz > 0.0f ? pz : 0.0f;
+            pz = pz < nat->mesh_offset[2] ? pz : nat->mesh_offset[2];
+            out[0] = (px / nat->target[0] * 2.0f + -1.0f) * cw;
+            out[1] = (py / nat->target[1] * -2.0f + 1.0f) * cw;
+            out[2] = pz * nat->mesh_offset[3] * cw;
+            out[3] = cw;
+        } else {
+            float ax = cx - (nat->mesh_offset[0] * 0.0625f - 0.5f) * cw, ay = cy - (nat->mesh_offset[1] * 0.0625f - 0.5f) * cw;
+            out[0] = ax / nat->target[0] * 2.0f + -cw;
+            out[1] = ay / nat->target[1] * -2.0f + cw;
+            out[2] = cz * nat->mesh_offset[3];
+            out[3] = cw;
+        }
+        uint32_t rgba = w[7];
+        out[8] = (float)(rgba & 255u); out[9] = (float)((rgba >> 8) & 255u);
+        out[10] = (float)((rgba >> 16) & 255u); out[11] = (float)(rgba >> 24);
+        return;
+    }
+    float x = as_f(w[0]), y = as_f(w[1]), z = as_f(w[2]);
     /* upscaled sprites sampled by whole texels cover whole GS pixels (finding 196) */
     if ((flags & 1024u) && !(flags & 32u) && (scale & 255u) > 1u) {
         x = __builtin_ceilf(x - 0.5f);

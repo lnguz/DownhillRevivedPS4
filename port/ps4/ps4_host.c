@@ -86,6 +86,10 @@ static void ps4_start(void)
         char value[16];
         if (!dhd_settings_read(DHD_DIR "/dhd.ini", "widescreen", value, sizeof value))
             dhd_settings_save(DHD_DIR "/dhd.ini", "widescreen", "1");
+        /* Native VU (the translated VU1 meshes, drawn by the GPU): the CPU's VU1 thread was the
+           race's limit without it */
+        if (!dhd_settings_read(DHD_DIR "/dhd.ini", "native_vu", value, sizeof value))
+            dhd_settings_save(DHD_DIR "/dhd.ini", "native_vu", "on");
     }
     if (exists(DHD_DIR "/headless")) setenv("DHD_HEADLESS", "1", 0);
     /* /data/dhd/native (any file): the native renderer (port/ps4/render_ps4.c), over dhd.ini's */
