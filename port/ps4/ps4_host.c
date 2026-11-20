@@ -88,6 +88,8 @@ static void ps4_start(void)
             dhd_settings_save(DHD_DIR "/dhd.ini", "widescreen", "1");
     }
     if (exists(DHD_DIR "/headless")) setenv("DHD_HEADLESS", "1", 0);
+    /* /data/dhd/native (any file): the native renderer (port/ps4/render_ps4.c), over dhd.ini's */
+    if (exists(DHD_DIR "/native")) setenv("DHD_RENDER", "native", 1);
     fprintf(stderr, "ps4: disc %s%s\n", getenv("DHD_ISO") ? getenv("DHD_ISO") : "(none in " DHD_DIR ")",
             getenv("DHD_HEADLESS") ? ", headless" : "");
 }

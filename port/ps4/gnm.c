@@ -13,7 +13,9 @@
    fence value, which the CPU polls. */
 #include "gnm.h"
 
+#include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <string.h>
 
@@ -124,8 +126,13 @@ static void acquire_mem(void)
     emit(0x0000000Au);
 }
 
+/* One command buffer is built at a time (gnm_begin to gnm_finish): the native renderer's thread and
+   the GS worker (the exact renderer's Z probe) both submit. */
+static pthread_mutex_t building = PTHREAD_MUTEX_INITIALIZER;
+
 void gnm_begin(void)
 {
+    pthread_mutex_lock(&building);
     gnm.count = 0;
     gnm.argument_used = 0;
     gnm.count += sceGnmDispatchInitDefaultHardwareState(gnm.commands, 256);
@@ -222,6 +229,7 @@ int gnm_finish(void)
     if (gnm.fence_value == 1) fprintf(stderr, "gnm: step 4, submitted (%d), waiting for the fence\n", rc);
     if (rc != 0) {
         fprintf(stderr, "gnm: sceGnmSubmitCommandBuffers failed (0x%08x)\n", (unsigned)rc);
+        pthread_mutex_unlock(&building);
         return 0;
     }
     uint64_t start = sceKernelGetProcessTime();
@@ -230,6 +238,7 @@ int gnm_finish(void)
             fprintf(stderr, "gnm: the GPU did not finish within 3 s (fence %u, want %u; start mark %u)\n",
                     *gnm.fence, value, gnm.marks[1]);
             gnm.failed = 1;
+            pthread_mutex_unlock(&building);
             return 0;
         }
         /* spin: the GPU's work takes micro- to milliseconds, and a sleep on the console lasts far
@@ -240,6 +249,7 @@ int gnm_finish(void)
     gnm_submits++;
     uint64_t t0 = gnm.marks[8] | (uint64_t)gnm.marks[9] << 32, t1 = gnm.marks[10] | (uint64_t)gnm.marks[11] << 32;
     if (t1 > t0) gnm_gpu_ticks += t1 - t0;
+    pthread_mutex_unlock(&building);
     return 1;
 }
 
@@ -567,6 +577,119 @@ static void scene_check(void)
     fprintf(stderr, "gnm: scene: %u pixels drawn\n", colored);
 }
 
+/* ---- for the native renderer (port/ps4/render_ps4.c) ---- */
+
+static uint8_t *graphics_code;    /* gcn_graphics, in GPU memory once (gnm_init) */
+
+int gnm_graphics_shader(const char *name, GnmShader *shader)
+{
+    uint32_t offset;
+    if (!graphics_code || !find_shader(name, &offset, &shader->rsrc1, &shader->rsrc2, &shader->ps_input_ena,
+                                       &shader->ps_input_addr))
+        return 0;
+    shader->address = (uint64_t)(uintptr_t)(graphics_code + offset);
+    return 1;
+}
+
+void gnm_context_reg(uint32_t reg, uint32_t value) { set_context(reg, value); }
+
+void gnm_context_regs(uint32_t reg, const uint32_t *values, uint32_t n)
+{
+    emit(PKT3(IT_SET_CONTEXT_REG, n + 1, 0));
+    emit(reg);
+    for (uint32_t i = 0; i < n; i++) emit(values[i]);
+}
+
+void gnm_graphics_sh(uint32_t reg, const uint32_t *values, uint32_t n)
+{
+    emit(PKT3(IT_SET_SH_REG, n + 1, 0));
+    emit(reg);
+    for (uint32_t i = 0; i < n; i++) emit(values[i]);
+}
+
+void gnm_uconfig_reg(uint32_t reg, uint32_t value)
+{
+    emit(PKT3(IT_SET_UCONFIG_REG, 2, 0));
+    emit(reg);
+    emit(value);
+}
+
+void gnm_draw_state_init(void) { gnm.count += sceGnmDrawInitDefaultHardwareState350(gnm.commands + gnm.count, 256); }
+
+void gnm_draw_auto(uint32_t count)
+{
+    emit(PKT3(IT_DRAW_INDEX_AUTO, 2, 0));
+    emit(count);
+    emit(2);  /* DRAW_INITIATOR: SOURCE_SELECT auto index */
+}
+
+/* Everything before done and in memory (colour and depth caches flushed, the L2 written back and
+   every cache invalidated) before anything after starts: an end-of-pipe event writes a value,
+   WAIT_REG_MEM holds the command processor until it is there. Between draws and the compute work
+   or draws that read what they drew. */
+void gnm_full_barrier(void)
+{
+    static uint32_t value;
+    uint64_t at = (uint64_t)(uintptr_t)&gnm.marks[4];
+    value++;
+    emit(PKT3(IT_EVENT_WRITE_EOP, 5, 0));
+    emit(0x14u | (5u << 8));  /* CACHE_FLUSH_AND_INV_TS_EVENT */
+    emit((uint32_t)at);
+    emit(((uint32_t)(at >> 32) & 0xFFFFu) | (1u << 29));  /* DATA_SEL: 32 bits */
+    emit(value);
+    emit(0);
+    emit(PKT3(0x3C, 6, 0));  /* WAIT_REG_MEM: memory, equal, by the ME */
+    emit(3u | (1u << 4));
+    emit((uint32_t)at);
+    emit((uint32_t)(at >> 32));
+    emit(value);
+    emit(0xFFFFFFFFu);
+    emit(4);  /* poll interval */
+    acquire_mem();
+}
+
+/* GPU memory that can be given back: one direct-memory mapping per allocation (64 KB granules). */
+typedef struct Mapping { void *address; off_t offset; size_t size; struct Mapping *next; } Mapping;
+static Mapping *mappings;
+static pthread_mutex_t mapping_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void *gnm_memory_alloc(size_t size, int garlic)
+{
+    size = (size + 65535) & ~(size_t)65535;
+    off_t offset;
+    void *address = NULL;
+    if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), size, 65536, garlic ? 3 : 0, &offset) != 0)
+        return NULL;
+    if (sceKernelMapDirectMemory(&address, size, 0x33, 0, offset, 65536) != 0) {
+        sceKernelReleaseDirectMemory(offset, size);
+        return NULL;
+    }
+    Mapping *m = malloc(sizeof *m);
+    if (!m) { sceKernelReleaseDirectMemory(offset, size); return NULL; }
+    m->address = address; m->offset = offset; m->size = size;
+    pthread_mutex_lock(&mapping_lock);
+    m->next = mappings;
+    mappings = m;
+    pthread_mutex_unlock(&mapping_lock);
+    return address;
+}
+
+void gnm_memory_free(void *address)
+{
+    if (!address) return;
+    pthread_mutex_lock(&mapping_lock);
+    for (Mapping **link = &mappings; *link; link = &(*link)->next)
+        if ((*link)->address == address) {
+            Mapping *m = *link;
+            *link = m->next;
+            pthread_mutex_unlock(&mapping_lock);
+            sceKernelReleaseDirectMemory(m->offset, m->size);  /* unmaps it too */
+            free(m);
+            return;
+        }
+    pthread_mutex_unlock(&mapping_lock);
+}
+
 int gnm_init(void)
 {
     if (gnm.ready || gnm.failed) return gnm.ready;
@@ -607,6 +730,7 @@ int gnm_init(void)
     gnm.failed = 0;
     if (!check()) { gnm.failed = 1; return 0; }
     gnm.ready = 1;
+    if ((graphics_code = gnm_alloc(sizeof gcn_graphics, 4096))) memcpy(graphics_code, gcn_graphics, sizeof gcn_graphics);
     triangle_check();
     scene_check();
     return 1;

@@ -35,6 +35,29 @@ int gnm_room(void);
 /* Submits what gnm_begin started and waits until the GPU has finished it and its writes reached
    memory. 0 on a timeout (the GPU path then turns itself off). */
 int gnm_finish(void);
+/* ---- graphics (the native renderer) ---- */
+typedef struct {
+    uint64_t address;            /* the code (256-byte aligned) */
+    uint32_t rsrc1, rsrc2;       /* SPI_SHADER_PGM_RSRC1/2 from LLVM (USER_SGPR is the caller's) */
+    uint32_t ps_input_ena, ps_input_addr;
+} GnmShader;
+/* A graphics stage by name (port/ps4/kernels/graphics). 0 when there is none. */
+int gnm_graphics_shader(const char *name, GnmShader *shader);
+/* Packets into the open buffer: context, graphics SH and UCONFIG registers (offsets from Mesa's
+   gfx7.json), the driver's default draw state, an auto-indexed draw of count vertices. */
+void gnm_context_reg(uint32_t reg, uint32_t value);
+void gnm_context_regs(uint32_t reg, const uint32_t *values, uint32_t n);
+void gnm_graphics_sh(uint32_t reg, const uint32_t *values, uint32_t n);
+void gnm_uconfig_reg(uint32_t reg, uint32_t value);
+void gnm_draw_state_init(void);
+void gnm_draw_auto(uint32_t count);
+/* All earlier work done and its writes in memory, every cache fresh, before later work starts. */
+void gnm_full_barrier(void);
+/* GPU memory that can be freed (direct memory, onion or garlic, 64 KB granules); NULL when there is
+   none. Any thread. */
+void *gnm_memory_alloc(size_t size, int garlic);
+void gnm_memory_free(void *address);
+
 /* Counts for the log: the time gnm_finish waited for the GPU (microseconds) and its submits. */
 extern uint64_t gnm_wait_us, gnm_submits, gnm_gpu_ticks;  /* gnm_gpu_ticks: the GPU's own clock, start to end */
 /* The GPU's clock (100 MHz) once the work before this point is done, for profiles: gnm_mark puts a
